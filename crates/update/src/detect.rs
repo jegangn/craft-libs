@@ -1,8 +1,8 @@
 //! Finding Craft Apps that are already installed, however they got there.
 //!
 //! - macOS: `<App>.app` in `/Applications` or `~/Applications`, read from its `Info.plist`.
-//! - Windows: the Windows Installer's uninstall entries (`Learning Machines LLC`), and portable
-//!   copies the launcher unpacked.
+//! - Windows: the Windows Installer's uninstall entries (`Learning Machines LLC`, or the app's
+//!   own developer), and portable copies the launcher unpacked.
 //! - Linux: AppImages in `~/Applications` (where the launcher and AppImageLauncher put them),
 //!   `~/AppImages` (Gear Lever) and `~/.local/bin`, Debian/RPM packages, Flatpaks, and tarball
 //!   installs.
@@ -93,10 +93,12 @@ pub(crate) fn appimage_version(name: &str, stems: &[&str]) -> Option<Option<Stri
 const PUBLISHER: &str = "Learning Machines LLC";
 
 /// Whether an uninstall entry's `DisplayName` and `Publisher` are `app`'s, under any name its
-/// installers have registered.
+/// installers have registered. An app with its own developer (TellMeCAD: "JP Automate Sdn.
+/// Bhd.") names that developer as its installer's publisher instead.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn is_installer_entry(app: &App, display_name: &str, publisher: &str) -> bool {
-    publisher == PUBLISHER && app.names().any(|n| n == display_name)
+    let ours = publisher == PUBLISHER || (app.developer != crate::app::DEVELOPER && publisher == app.developer);
+    ours && app.names().any(|n| n == display_name)
 }
 
 /// Where a Windows install of `app` may keep its exe, in the order to try: the entry's
@@ -732,6 +734,21 @@ mod tests {
     fn pdfcraft_still_matches_its_own_installer_name() {
         let pdf = App::by_id("pdfcraft").unwrap();
         assert!(is_installer_entry(pdf, "PdfCraft", LEARNING_MACHINES));
+    }
+
+    /// TellMeCAD's installer names its own developer as the publisher; the suite's default
+    /// developer never stands in for the suite's publisher.
+    #[test]
+    fn an_app_with_its_own_developer_matches_entries_from_that_publisher() {
+        let tellmecad = App { developer: "JP Automate Sdn. Bhd.", ..App::new("tellmecad", "TellMeCAD", "CAD", "jegangn/tellmecad-releases") };
+        assert!(is_installer_entry(&tellmecad, "TellMeCAD", "JP Automate Sdn. Bhd."));
+        assert!(is_installer_entry(&tellmecad, "TellMeCAD", LEARNING_MACHINES));
+        assert!(!is_installer_entry(&tellmecad, "TellMeCAD", "Some Other Publisher"));
+        assert!(!is_installer_entry(&tellmecad, "PhotoCraft", "JP Automate Sdn. Bhd."));
+        for a in SUITE.iter() {
+            assert!(!is_installer_entry(a, a.name, crate::app::DEVELOPER), "{} matched its default developer", a.name);
+            assert!(!is_installer_entry(a, a.name, "JP Automate Sdn. Bhd."), "{}", a.name);
+        }
     }
 
     #[test]

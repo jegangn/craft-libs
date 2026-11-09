@@ -781,13 +781,14 @@ fn same_cache_as_helper(app: &App, paths: &Paths, exe: &Path) -> Result<(), Stri
     }
 }
 
-/// Accepts `file` when it carries a valid Authenticode signature from the same publisher as
-/// `reference`, this program. Refuses an unsigned file, another publisher's, and every file when
-/// `reference` itself isn't signed.
+/// Accepts `file` when `reference`, this program, carries no valid Authenticode signature: an
+/// unsigned copy (TellMeCAD's builds) trusts the download because `install::download` already
+/// compared its SHA-256 with the release's. A signed copy accepts only a file with a valid
+/// signature from its own publisher, and refuses an unsigned file or another publisher's.
 #[cfg(windows)]
 fn signed_like(app: &App, reference: &Path, file: &Path) -> Result<(), String> {
     let publisher = |path: &Path| verifysign::verify_file(path).map(|signature| signature.subject_name());
-    let ours = publisher(reference).map_err(|e| format!("this copy of {} isn't signed ({e}), so it doesn't install updates", app.name))?;
+    let Ok(ours) = publisher(reference) else { return Ok(()) };
     let theirs = publisher(file).map_err(|e| format!("{} isn't signed ({e})", file.display()))?;
     if ours == theirs { Ok(()) } else { Err(format!("{} isn't signed by {}'s publisher", file.display(), app.name)) }
 }
@@ -1327,29 +1328,32 @@ mod tests {
         gone.id()
     }
 
-    /// A catalog-signed program matches itself; an unsigned one never does, on either side.
+    /// A signed copy accepts only files from its own publisher. An unsigned copy (TellMeCAD's
+    /// builds) accepts any file: the download already passed the release's checksum test.
     #[cfg(windows)]
     #[test]
-    fn a_file_must_be_signed_by_the_launchers_own_publisher() {
+    fn a_signed_copy_needs_its_publisher_and_an_unsigned_copy_trusts_the_checksum() {
         let cmd = system_program("cmd.exe");
         // `cargo test` binaries are unsigned.
         let unsigned = std::env::current_exe().unwrap();
         assert_eq!(signed_like(&crate::suite::LAUNCHER, &cmd, &cmd), Ok(()));
         assert!(signed_like(&crate::suite::LAUNCHER, &cmd, &unsigned).is_err_and(|e| e.contains("isn't signed")));
-        assert!(signed_like(&crate::suite::LAUNCHER, &unsigned, &cmd).is_err_and(|e| e.contains("doesn't install updates")));
+        assert_eq!(signed_like(&crate::suite::LAUNCHER, &unsigned, &cmd), Ok(()));
+        assert_eq!(signed_like(&crate::suite::LAUNCHER, &unsigned, &unsigned), Ok(()));
     }
 
-    /// An unsigned launcher says so before it quits for an update. `cargo test` binaries are
-    /// unsigned, like a package built without the signing secrets.
+    /// An unsigned copy passes the signature check before it quits for an update; any refusal
+    /// comes from a later check. `cargo test` binaries are unsigned, like TellMeCAD's builds.
     #[cfg(windows)]
     #[test]
-    fn an_unsigned_launcher_refuses_to_update_before_it_quits() {
+    fn an_unsigned_launcher_passes_the_signature_check_before_it_quits() {
         let dir = tempfile::tempdir().unwrap();
         let msi = dir.path().join("artcraft-launcher-0.2.0-windows-x64.msi");
         std::fs::write(&msi, "not a package").unwrap();
         for install in [Install::Msi(system_program("msiexec.exe")), Install::Portable(system_program("msiexec.exe"))] {
-            let error = windows_precheck(&crate::suite::LAUNCHER, &install, &Paths::under(dir.path()), &msi).unwrap_err();
-            assert!(error.contains("isn't signed"), "{error}");
+            if let Err(error) = windows_precheck(&crate::suite::LAUNCHER, &install, &Paths::under(dir.path()), &msi) {
+                assert!(!error.contains("isn't signed"), "{error}");
+            }
         }
     }
 
