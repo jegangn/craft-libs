@@ -217,11 +217,15 @@ fn msi_step(app: &App, exe: &Path) -> Result<crate::msi_migrate::Step, String> {
     crate::msi_migrate::windows::step(app, exe)
 }
 
+/// How long the Windows update helper waits for the app to exit before it gives up.
+pub(crate) const HELPER_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Whether the helper starts the app after the update step: always after a successful one, and
-/// after a failed one only while its exe is still there.
+/// after a failed one only while its exe is still there. Never while the old app still runs (its
+/// user kept it open past [`HELPER_WAIT`]): that would open a second copy beside it.
 #[cfg_attr(not(windows), allow(dead_code))]
-fn restarts(step_succeeded: bool, exe_exists: bool) -> bool {
-    step_succeeded || exe_exists
+fn restarts(step_succeeded: bool, exe_exists: bool, app_exited: bool) -> bool {
+    app_exited && (step_succeeded || exe_exists)
 }
 
 /// The exe to start after an MSI update of a registered copy: the one its registrations name now
@@ -690,7 +694,7 @@ pub fn finish(app: &App, args: &[OsString]) -> Option<Result<(), String>> {
     // Read before the step: the update may move or replace the old exe.
     let registered =
         matches!(step, Finish::Msi(_)) && matches!(crate::msi_copy::windows::find(app, &exe), Some(crate::msi_copy::MsiCopy::Registered { .. }));
-    let done = run_step(app, &me, pid, &exe, &step, std::time::Duration::from_secs(60));
+    let done = run_step(app, &me, pid, &exe, &step, HELPER_WAIT);
     if let Err(e) = &done {
         record_failure(&paths, e);
     }
@@ -698,7 +702,8 @@ pub fn finish(app: &App, args: &[OsString]) -> Option<Result<(), String>> {
     let exe = if done.is_ok() { exe_after_msi(app, registered, &exe) } else { exe };
     // A failed move can leave no program to start; its recorded error already says how to get
     // the app back, and a restart error must not replace it.
-    if !restarts(done.is_ok(), exe.is_file()) {
+    let exited = process::wait_for_exit(pid, std::time::Duration::ZERO);
+    if !restarts(done.is_ok(), exe.is_file(), exited) {
         return Some(done);
     }
     let started = signed_like(app, &me, &exe)
@@ -1816,10 +1821,17 @@ mod tests {
 
     #[test]
     fn a_failed_step_that_removed_the_app_starts_nothing_and_keeps_its_message() {
-        assert!(restarts(true, true));
-        assert!(restarts(true, false));
-        assert!(restarts(false, true));
-        assert!(!restarts(false, false));
+        assert!(restarts(true, true, true));
+        assert!(restarts(true, false, true));
+        assert!(restarts(false, true, true));
+        assert!(!restarts(false, false, true));
+    }
+
+    /// The app still runs after the helper's wait (its user kept it open): a second copy of it
+    /// would open beside the first, so nothing starts.
+    #[test]
+    fn an_app_still_running_after_the_wait_gets_no_second_copy() {
+        assert!(!restarts(false, true, false));
     }
 
     #[test]

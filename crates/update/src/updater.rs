@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::dialog::{StartupPrompt, StartupPromptResponse};
 use crate::pins::{Choice, Pins};
@@ -47,6 +47,10 @@ pub enum Action {
 
 type Checked = Result<Option<Release>, String>;
 
+/// How long before the helper stops waiting the app stops asking to close for the update: the time
+/// the close itself takes.
+const RESTART_MARGIN: Duration = Duration::from_secs(15);
+
 pub struct Updater {
     app: &'static App,
     version: String,
@@ -58,9 +62,11 @@ pub struct Updater {
     check: Option<Receiver<Checked>>,
     install: Option<(Receiver<Result<(), String>>, Release)>,
     prompt: Option<StartupPrompt>,
-    restart: bool,
-    /// An update is installed and waits for the app to exit; nothing starts a second one.
-    installed: bool,
+    /// The app is to close for the installed update before this moment, while the restart helper
+    /// still waits for it ([`self_update::HELPER_WAIT`]).
+    restart_by: Option<Instant>,
+    /// The update installed, waiting for the app to exit; nothing starts a second one.
+    installed: Option<Release>,
     /// The version-choice file to read in place of [`Pins::default_path`] (tests).
     pins_path: Option<PathBuf>,
     /// The launcher's choice for this app when it is not stable, as of the last check or offer.
@@ -81,8 +87,8 @@ impl Updater {
             check: None,
             install: None,
             prompt: None,
-            restart: false,
-            installed: false,
+            restart_by: None,
+            installed: None,
             pins_path: None,
             managed: None,
         }
@@ -118,7 +124,7 @@ impl Updater {
             log::info!("{} follows the launcher's choice ({choice:?}); no update offered here", self.app.name);
             // A prompt opened before the pin would still install the stable release. One that is
             // installing or finished stays: `tick` reports through it.
-            if self.install.is_none() && !self.installed {
+            if self.install.is_none() && self.installed.is_none() {
                 self.prompt = None;
             }
         }
@@ -141,7 +147,7 @@ impl Updater {
 
     /// Opens the startup prompt for a release the app found itself.
     pub fn offer(&mut self, release: Release) {
-        if self.install.is_none() && !self.installed && !self.read_choice() {
+        if self.install.is_none() && self.installed.is_none() && !self.read_choice() {
             self.prompt = Some(StartupPrompt::new(self.app, release, self.version.clone()));
         }
     }
@@ -162,8 +168,38 @@ impl Updater {
         self.prompt.is_some()
     }
 
+    /// What the prompt says once the update is installed: close to finish while the helper still
+    /// waits, otherwise that the update comes back at the next start.
+    fn installed_message(&self) -> String {
+        let name = self.app.name;
+        if self.restart_by.is_some_and(|by| Instant::now() < by) {
+            format!("The update is installed. Close {name} to finish; it restarts by itself.")
+        } else {
+            format!("If {name} stays open, the update is offered again the next time it starts.")
+        }
+    }
+
+    /// Brings the prompt back as the update stands: installing, or installed.
+    fn reopen_prompt(&mut self) {
+        if self.prompt.is_some() {
+            return;
+        }
+        let installing = self.install.as_ref().map(|(_, release)| release.clone());
+        let Some(release) = installing.clone().or_else(|| self.installed.clone()) else { return };
+        let mut prompt = StartupPrompt::new(self.app, release, self.version.clone());
+        prompt.is_installing = installing.is_some();
+        if installing.is_none() {
+            prompt.status_message = Some(self.installed_message());
+        }
+        self.prompt = Some(prompt);
+    }
+
     fn begin(&mut self, ctx: &egui::Context, requested: bool) {
-        if self.install.is_some() || self.installed {
+        if self.install.is_some() || self.installed.is_some() {
+            // Help ▸ Check for Updates shows how the update stands instead of nothing.
+            if requested {
+                self.reopen_prompt();
+            }
             return;
         }
         if requested {
@@ -210,7 +246,7 @@ impl Updater {
         match answer {
             Ok(Some(release)) => {
                 self.status = Status::Idle;
-                if self.prompt.is_none() && self.install.is_none() && !self.installed {
+                if self.prompt.is_none() && self.install.is_none() && self.installed.is_none() {
                     self.prompt = Some(StartupPrompt::new(self.app, release, self.version.clone()));
                 }
             }
@@ -251,12 +287,12 @@ impl Updater {
                 let release = self.install.take().map(|(_, release)| release);
                 match outcome {
                     Ok(()) => {
-                        self.installed = true;
-                        self.restart = true;
+                        self.installed = Some(release.unwrap_or_default());
+                        self.restart_by = Instant::now().checked_add(self_update::HELPER_WAIT.saturating_sub(RESTART_MARGIN));
+                        let message = self.installed_message();
                         if let Some(prompt) = &mut self.prompt {
                             prompt.is_installing = false;
-                            prompt.status_message =
-                                Some(format!("The update is installed. Close {} to finish; it restarts by itself.", self.app.name));
+                            prompt.status_message = Some(message);
                         }
                     }
                     Err(e) => {
@@ -286,11 +322,23 @@ impl Updater {
     /// `false` while it holds unsaved work: the restart helper is scheduled before the app closes,
     /// and a close that the user then cancels would leave it waiting for an exit that never comes.
     pub fn show_if(&mut self, ctx: &egui::Context, can_start: bool) -> Action {
-        // The close waits for the app to hold no unsaved work: the user may have edited while the
-        // update installed, and a close they cancel is asked again once the work is saved.
-        if self.restart && can_start {
-            self.restart = false;
-            return Action::Close;
+        // The helper waits only so long for the app to exit, so the close is asked for at once, also
+        // with unsaved work (the app's own close asks about it: the user may have edited while the
+        // update installed), and never once the helper has stopped waiting: a close held back until
+        // the work was saved came after the helper had given up, and only closed the app.
+        if let Some(by) = self.restart_by.take() {
+            let due = Instant::now() < by;
+            let name = self.app.name;
+            if let Some(prompt) = &mut self.prompt {
+                prompt.status_message = Some(if due {
+                    format!("Closing {name} to finish the update. If {name} stays open, the update is offered again the next time it starts.")
+                } else {
+                    format!("The update wasn't installed because {name} stayed open. It is offered again the next time {name} starts.")
+                });
+            }
+            if due {
+                return Action::Close;
+            }
         }
         let Some(prompt) = &mut self.prompt else { return Action::None };
         match prompt.show(ctx) {
@@ -322,14 +370,17 @@ impl Updater {
 
     fn start_install(&mut self, ctx: &egui::Context) {
         // The launcher may have pinned the app while the prompt was open; that closes it.
-        if self.install.is_none() && !self.installed && self.read_choice() {
+        if self.install.is_none() && self.installed.is_none() && self.read_choice() {
+            return;
+        }
+        if self.installed.is_some() {
+            let message = self.installed_message();
+            if let Some(prompt) = &mut self.prompt {
+                prompt.status_message = Some(message);
+            }
             return;
         }
         let Some(prompt) = &mut self.prompt else { return };
-        if self.installed {
-            prompt.status_message = Some(format!("The update is installed. Close {} to finish; it restarts by itself.", self.app.name));
-            return;
-        }
         let Some(installed) = self_update::current(self.app) else {
             prompt.status_message = Some("Cannot auto-update this installation type. Please download manually.".into());
             prompt.is_installing = false;
@@ -551,10 +602,24 @@ mod tests {
         u.tick(&ctx);
         assert_eq!(u.show(&ctx), Action::Close);
         u.prompt = None;
-        u.check_now(&ctx);
-        assert!(u.check.is_none(), "no check after an install");
         u.offer(newer());
         assert!(!u.prompt_open(), "no second offer after an install");
+        u.check_now(&ctx);
+        assert!(u.check.is_none(), "no check after an install");
+        // Help ▸ Check for Updates shows what is left to do instead of nothing.
+        assert!(u.prompt.as_ref().is_some_and(|p| p.status_message.is_some()), "the prompt says what is left to do");
+    }
+
+    /// Help ▸ Check for Updates while an update installs shows its prompt again instead of nothing.
+    #[test]
+    fn a_check_asked_for_while_an_update_installs_shows_its_prompt() {
+        let ctx = egui::Context::default();
+        let mut u = updater(Ok(None));
+        let (_tx, rx) = channel::<Result<(), String>>();
+        u.install = Some((rx, newer()));
+        u.check_now(&ctx);
+        assert!(u.check.is_none(), "no check while it installs");
+        assert!(u.prompt.as_ref().is_some_and(|p| p.is_installing), "the prompt shows it installing");
     }
 
     #[test]
@@ -574,8 +639,11 @@ mod tests {
         action
     }
 
+    /// The helper waits only a minute for the app to exit, so a finished install asks the app to
+    /// close at once, unsaved work or not (the app's own close asks about that work), and never
+    /// later: a close held back until the work was saved came after the helper had given up.
     #[test]
-    fn a_finished_install_keeps_asking_to_close_until_the_app_can() {
+    fn a_finished_install_asks_the_app_to_close_at_once_even_with_unsaved_work() {
         let ctx = egui::Context::default();
         let mut u = updater(Ok(None));
         u.offer(newer());
@@ -583,9 +651,10 @@ mod tests {
         u.install = Some((rx, newer()));
         assert!(tx.send(Ok(())).is_ok());
         u.tick(&ctx);
-        assert_eq!(frame(&mut u, &ctx, false), Action::None, "unsaved work holds the close back");
-        assert_eq!(frame(&mut u, &ctx, true), Action::Close);
-        assert_eq!(frame(&mut u, &ctx, true), Action::None);
+        assert_eq!(frame(&mut u, &ctx, false), Action::Close, "unsaved work doesn't hold the close back");
+        assert_eq!(frame(&mut u, &ctx, true), Action::None, "asked once: never again once the work is saved");
+        let said = u.prompt.as_ref().and_then(|p| p.status_message.clone()).unwrap_or_default();
+        assert!(said.contains("next time"), "a close that is cancelled says what happens then: {said}");
     }
 
     #[test]
