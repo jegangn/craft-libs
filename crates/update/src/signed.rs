@@ -7,7 +7,7 @@
 use minisign_verify::{PublicKey, Signature};
 
 use crate::app::App;
-use crate::http::Http;
+use crate::http::{BytesError, Http};
 use crate::release::{self, Release};
 
 /// The largest signature file read: a minisign signature is a few hundred bytes.
@@ -50,10 +50,26 @@ pub enum Checked {
     Unsigned,
 }
 
+/// What a signature or checksum list over its size cap means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OverCap {
+    /// The release is [`Checked::Unsigned`]: choosing a release to offer. Whoever uploads a
+    /// release picks the size of its files, so as an error one fake release would block every
+    /// update.
+    Unsigned,
+    /// An error: installing a release, which must not quietly turn into "nothing to install".
+    Error,
+}
+
 /// Checks `release`'s checksum list against `app`'s signing keys. `Err` means it couldn't be found
 /// out: a fetch of the signature or the list failed (no connection, a timeout, an HTTP error other
 /// than 404, a file over its cap), or the app's key list is unreadable.
 pub fn check_release(app: &App, release: &Release, http: &Http) -> Result<Checked, String> {
+    check(app, release, http, OverCap::Error)
+}
+
+/// [`check_release`], with a file over its cap meaning what `over_cap` says.
+fn check(app: &App, release: &Release, http: &Http, over_cap: OverCap) -> Result<Checked, String> {
     let keys = keys(app.signing_keys).map_err(|e| {
         log::warn!("{}: {e}", app.name);
         NOT_SIGNED.to_string()
@@ -64,7 +80,15 @@ pub fn check_release(app: &App, release: &Release, http: &Http) -> Result<Checke
     let Some(sums) = release.sums_asset() else { return Ok(Checked::Unsigned) };
     // A release known only from its checksum list doesn't list its signature: it sits beside the list.
     let signature_url = release.signature_asset().map_or_else(|| format!("{}.minisig", sums.url), |a| a.url.clone());
-    let fetch = |url: &str, max: usize| http.get_bytes(url, max).map_err(|e| format!("couldn't fetch the release's checksums ({e}). Try again"));
+    // `Ok(None)`: no file to check (a 404, or over its cap while choosing what to offer).
+    let fetch = |url: &str, max: usize| match http.get_bytes_capped(url, max) {
+        Ok(bytes) => Ok(bytes),
+        Err(BytesError::TooBig(e)) if over_cap == OverCap::Unsigned => {
+            log::info!("{}: {}: {e}", app.name, release.tag);
+            Ok(None)
+        }
+        Err(e) => Err(format!("couldn't fetch the release's checksums ({}). Try again", e.into_message())),
+    };
     let Some(signature) = fetch(&signature_url, MAX_SIGNATURE)? else { return Ok(Checked::Unsigned) };
     let Some(signature) = std::str::from_utf8(&signature).ok().and_then(|text| Signature::decode(text).ok()) else { return Ok(Checked::Unsigned) };
     let Some(list) = fetch(&sums.url, MAX_SUMS)? else { return Ok(Checked::Unsigned) };
@@ -86,15 +110,15 @@ pub fn verified_sums(app: &App, release: &Release, http: &Http) -> Result<Option
 
 /// The first of the [`MAX_CANDIDATES`] newest `candidates` (newest first) whose checksum list has
 /// a valid signature and names a file of that release's version; a release without one is skipped
-/// without a word. A check that fails (see [`check_release`]) fails the whole choice, so a network
-/// hiccup never offers an older release. With no keys set: the first candidate, and nothing is
+/// without a word, and so is one whose signature or list is over its cap. A check that fails (see
+/// [`check_release`]) fails the whole choice, so a network hiccup never offers an older release. With no keys set: the first candidate, and nothing is
 /// fetched.
 pub fn newest_signed(app: &App, candidates: Vec<Release>, http: &Http) -> Result<Option<Release>, String> {
     if keys(app.signing_keys).map_err(|_| NOT_SIGNED)?.is_empty() {
         return Ok(candidates.into_iter().next());
     }
     for candidate in candidates.into_iter().take(MAX_CANDIDATES) {
-        match check_release(app, &candidate, http)? {
+        match check(app, &candidate, http, OverCap::Unsigned)? {
             Checked::NoKeys => return Ok(Some(candidate)),
             Checked::Signed(sums) if names_its_version(app, &candidate, &sums) => return Ok(Some(candidate)),
             Checked::Signed(_) => log::info!("{}: skipping {}: its signed checksum list names no file of that version", app.name, candidate.tag),

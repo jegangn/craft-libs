@@ -458,7 +458,14 @@ mod tests {
             let version = u.version.clone();
             let repo = app.repo;
             u = u.with_source(Arc::new(move || {
-                crate::offered_release(r#"[{"tag_name":"v1.0.0","name":"Test release","draft":false,"prerelease":false}]"#, repo, &version)
+                let http = crate::Http::new(crate::TEST_AGENT)?;
+                crate::offered_release(
+                    app,
+                    &http,
+                    r#"[{"tag_name":"v1.0.0","name":"Test release","draft":false,"prerelease":false}]"#,
+                    repo,
+                    &version,
+                )
             }));
             let ctx = egui::Context::default();
             u.check_at_start(&ctx);

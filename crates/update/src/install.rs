@@ -2310,6 +2310,20 @@ mod tests {
             assert!(!kept);
         }
 
+        /// The offer route skips a release whose signature is over its cap; installing one that
+        /// was offered anyway (the file changed since) still stops with an error.
+        #[test]
+        fn an_oversized_signature_is_refused_before_the_file_is_fetched() {
+            let (kp, (_, sha)) = (key_pair(), body());
+            let list = format!("{sha}  {NAME}\n");
+            let padded = format!("{}{}", sign(&kp, &list), "\n".repeat(5 * 1024));
+            let (release, asset, requests) = release(Some(&sha), &list, Some(padded), 1);
+            let (result, kept) = fetch(&app(&kp.pk.to_base64()), &release, &asset);
+            assert!(result.as_ref().is_err_and(|e| e.contains("more than")), "{result:?}");
+            assert!(requests.lock().unwrap().is_empty(), "the file wasn't fetched");
+            assert!(!kept);
+        }
+
         #[test]
         fn a_release_signed_by_another_key_is_refused_before_the_file_is_fetched() {
             let (kp, other, (_, sha)) = (key_pair(), key_pair(), body());

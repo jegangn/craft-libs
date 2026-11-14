@@ -203,21 +203,29 @@ impl Http {
     /// `max` bytes is refused: by its announced length before a byte is read, and by a hard limit
     /// on the body when the length wasn't announced or was wrong.
     pub fn get_bytes(&self, url: &str, max: usize) -> Result<Option<Vec<u8>>, String> {
+        self.get_bytes_capped(url, max).map_err(BytesError::into_message)
+    }
+
+    /// [`get_bytes`](Self::get_bytes), with a file over `max` bytes told apart from a failed
+    /// fetch ([`BytesError::TooBig`]).
+    pub(crate) fn get_bytes_capped(&self, url: &str, max: usize) -> Result<Option<Vec<u8>>, BytesError> {
         let agent = if is_loopback(url) { &self.direct } else { &self.small };
-        let mut resp = agent.get(url).call().map_err(|e| format!("couldn't reach {} ({e})", host(url)))?;
+        let mut resp = agent.get(url).call().map_err(|e| BytesError::Failed(format!("couldn't reach {} ({e})", host(url))))?;
         match resp.status().as_u16() {
             200 => {
                 let announced = resp.headers().get("content-length").and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
-                let too_big = || format!("{} sent more than {max} bytes", host(url));
+                let too_big = || BytesError::TooBig(format!("{} sent more than {max} bytes", host(url)));
                 if announced.is_some_and(|n| n > max as u64) {
                     return Err(too_big());
                 }
-                let body = read_bytes_capped(&mut resp, max)
-                    .map_err(|e| if e.contains("larger than") { too_big() } else { format!("unreadable answer ({e})") })?;
+                let body = read_bytes_capped(&mut resp, max).map_err(|e| match e {
+                    Capped::TooBig => too_big(),
+                    Capped::Unreadable(e) => BytesError::Failed(format!("unreadable answer ({e})")),
+                })?;
                 Ok(Some(body))
             }
             404 => Ok(None),
-            s => Err(format!("{} answered HTTP {s}", host(url))),
+            s => Err(BytesError::Failed(format!("{} answered HTTP {s}", host(url)))),
         }
     }
 
@@ -622,12 +630,36 @@ fn read_text_capped(resp: &mut ureq::http::Response<ureq::Body>, max: u64) -> Re
 }
 
 /// Reads a binary body, rejecting one whose decoded size exceeds `max` (CWE-409).
-fn read_bytes_capped(resp: &mut ureq::http::Response<ureq::Body>, max: usize) -> Result<Vec<u8>, String> {
+/// Why [`Http::get_bytes_capped`] gave no file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum BytesError {
+    /// The file is larger than the cap: by its announced length, or as it was read.
+    TooBig(String),
+    /// Anything else: no connection, a timeout, an HTTP error other than 404, an unreadable body.
+    Failed(String),
+}
+
+impl BytesError {
+    /// The message, the same for both kinds.
+    pub(crate) fn into_message(self) -> String {
+        match self {
+            BytesError::TooBig(e) | BytesError::Failed(e) => e,
+        }
+    }
+}
+
+/// Why [`read_bytes_capped`] stopped.
+enum Capped {
+    TooBig,
+    Unreadable(String),
+}
+
+fn read_bytes_capped(resp: &mut ureq::http::Response<ureq::Body>, max: usize) -> Result<Vec<u8>, Capped> {
     let mut reader = resp.body_mut().with_config().reader().take((max as u64).saturating_add(1));
     let mut bytes = Vec::new();
-    reader.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    reader.read_to_end(&mut bytes).map_err(|e| Capped::Unreadable(e.to_string()))?;
     if bytes.len() > max {
-        return Err(format!("the answer is larger than {max} bytes"));
+        return Err(Capped::TooBig);
     }
     Ok(bytes)
 }
@@ -1109,6 +1141,35 @@ pub(crate) mod tests {
         // A plain 403 (blocked, private, …) isn't a rate limit.
         assert_eq!(refused_until(403, Some("12"), Some(NOW + 1800), None, NOW), None);
         assert_eq!(refused_until(403, None, None, None, NOW), None);
+    }
+
+    /// "Too big" is its own kind of error, whether the length was announced or only found while
+    /// reading, so a caller can tell it from a failed fetch without reading the message.
+    #[test]
+    fn too_big_is_told_apart_from_a_failed_fetch() {
+        let (body, _) = body();
+        let http = Http::new(crate::TEST_AGENT).unwrap();
+        let (url, _) = serve(body.clone(), vec![Reply::Full]);
+        assert!(matches!(http.get_bytes_capped(&url, body.len() - 1), Err(BytesError::TooBig(e)) if e.contains("more than")));
+        // No Content-Length: the body is cut off at the cap while it is read.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let unannounced = format!("http://{}/file.bin", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else { return };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n" {
+                line.clear();
+            }
+            let _ = write!(stream, "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n").and_then(|()| stream.write_all(&[b'A'; 200]));
+        });
+        assert!(matches!(http.get_bytes_capped(&unannounced, 100), Err(BytesError::TooBig(e)) if e.contains("more than 100 bytes")));
+        // A server error and no connection are failed fetches.
+        let (base, _) = crate::signed::tests::serve_files(vec![("/broken", None)]);
+        assert!(matches!(http.get_bytes_capped(&format!("{base}/broken"), 100), Err(BytesError::Failed(e)) if e.contains("HTTP 500")));
+        assert!(matches!(http.get_bytes_capped("http://127.0.0.1:9/x", 100), Err(BytesError::Failed(_))));
+        // A 404 is no file, not an error.
+        assert_eq!(http.get_bytes_capped(&format!("{base}/missing"), 100), Ok(None));
     }
 
     #[test]

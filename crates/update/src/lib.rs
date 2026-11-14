@@ -120,9 +120,18 @@ mod offer_tests {
 
     /// `release` with `list` and its signature by `signer` (`None`: HTTP 500) served from this
     /// machine; the paths asked for.
-    fn served_list(mut release: Release, list: &str, signer: Option<&minisign::KeyPair>) -> (Release, Requests) {
-        let signature = signer.map(|s| minisign::sign(Some(&s.pk), &s.sk, list.as_bytes(), None, None).unwrap().into_string().into_bytes());
-        let (base, requests) = serve_files(vec![("/SHA256SUMS.txt", Some(list.as_bytes().to_vec())), ("/SHA256SUMS.txt.minisig", signature)]);
+    fn served_list(release: Release, list: &str, signer: Option<&minisign::KeyPair>) -> (Release, Requests) {
+        served_bytes(release, Some(list.as_bytes().to_vec()), signer.map(|s| sign(s, list).into_bytes()))
+    }
+
+    fn sign(signer: &minisign::KeyPair, list: &str) -> String {
+        minisign::sign(Some(&signer.pk), &signer.sk, list.as_bytes(), None, None).unwrap().into_string()
+    }
+
+    /// `release` with the bytes `list` and `signature` (`None`: HTTP 500) served from this
+    /// machine; the paths asked for.
+    fn served_bytes(mut release: Release, list: Option<Vec<u8>>, signature: Option<Vec<u8>>) -> (Release, Requests) {
+        let (base, requests) = serve_files(vec![("/SHA256SUMS.txt", list), ("/SHA256SUMS.txt.minisig", signature)]);
         for asset in &mut release.assets {
             if let Some(name) = ["SHA256SUMS.txt", "SHA256SUMS.txt.minisig"].iter().find(|n| **n == asset.name) {
                 asset.url = format!("{base}/{name}");
@@ -155,6 +164,44 @@ mod offer_tests {
         let ours = key_pair();
         // The newest release's signature answers HTTP 500.
         let (newest, _) = served_list(bare("v1.0.5"), &list_for("1.0.5"), None);
+        let (older, _) = release("v1.0.4", &ours);
+        let http = Http::new(crate::TEST_AGENT).unwrap();
+        let result = offer(&keyed(&ours), &http, vec![newest, older], "1.0.3");
+        assert!(result.as_ref().is_err_and(|e| e.contains("couldn't fetch")), "{result:?}");
+    }
+
+    /// Whoever uploads a release chooses the size of its files: a fake newest release whose
+    /// signature or checksum list is over its cap is skipped like an unsigned one, so it can't
+    /// block the signed release below it.
+    #[test]
+    fn an_oversized_signature_or_list_skips_the_release_for_the_signed_one_below() {
+        let ours = key_pair();
+        let http = Http::new(crate::TEST_AGENT).unwrap();
+        // A valid signature with 5 KiB of padding (the cap is 4 KiB).
+        let list = list_for("9.9.9");
+        let mut padded = sign(&ours, &list).into_bytes();
+        padded.extend(vec![b'\n'; 5 * 1024]);
+        let (fake, fake_requests) = served_bytes(bare("v9.9.9"), Some(list.into_bytes()), Some(padded));
+        let (real, _) = release("v1.0.4", &ours);
+        assert_eq!(offer(&keyed(&ours), &http, vec![fake, real], "1.0.3").unwrap().map(|r| r.tag).as_deref(), Some("v1.0.4"));
+        assert_eq!(asked(&fake_requests, "/SHA256SUMS.txt"), 0, "the list of a release whose signature is refused isn't fetched");
+        // A validly signed list of 300 KiB (the cap is 256 KiB).
+        let mut long = list_for("9.9.9");
+        while long.len() < 300 * 1024 {
+            long.push_str(&list_for("9.9.9"));
+        }
+        let (fake, _) = served_list(bare("v9.9.9"), &long, Some(&ours));
+        let (real, _) = release("v1.0.4", &ours);
+        assert_eq!(offer(&keyed(&ours), &http, vec![fake, real], "1.0.3").unwrap().map(|r| r.tag).as_deref(), Some("v1.0.4"));
+    }
+
+    /// A server error is no proof of a missing signature: the list answering HTTP 500 fails the
+    /// check, as the signature answering 500 does.
+    #[test]
+    fn a_server_error_for_the_list_fails_the_check() {
+        let ours = key_pair();
+        let list = list_for("1.0.5");
+        let (newest, _) = served_bytes(bare("v1.0.5"), None, Some(sign(&ours, &list).into_bytes()));
         let (older, _) = release("v1.0.4", &ours);
         let http = Http::new(crate::TEST_AGENT).unwrap();
         let result = offer(&keyed(&ours), &http, vec![newest, older], "1.0.3");
