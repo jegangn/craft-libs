@@ -21,63 +21,242 @@ const MAX_CANDIDATES: usize = 5;
 const NOT_SIGNED: &str =
     "the release's checksum list has no valid signature, so it can't be verified and wasn't installed. Try again later, or report it on GitHub.";
 
-/// Reads a key list: one minisign public key (base64) on a line; a line that starts with `#` is a
-/// comment, and empty lines are skipped. An empty text gives no keys.
+/// Reads a key list, in these steps: a byte order mark at the start is an error; the text is split
+/// on `\n`; one trailing `\r` is stripped from each line; spaces and tabs (nothing else) are
+/// trimmed from both ends; a line that is then empty, or starts with `#`, is skipped; every other
+/// line must be one minisign public key (base64), and one bad line makes the whole list an error.
+/// A text with no key line gives no keys.
 pub fn keys(text: &str) -> Result<Vec<PublicKey>, String> {
-    text.lines()
+    if text.starts_with('\u{feff}') {
+        return Err("the update keys start with a byte order mark".into());
+    }
+    text.split('\n')
         .enumerate()
-        .map(|(n, line)| (n, line.trim()))
+        .map(|(n, line)| (n, line.strip_suffix('\r').unwrap_or(line).trim_matches([' ', '\t'])))
         .filter(|(_, line)| !line.is_empty() && !line.starts_with('#'))
         .map(|(n, line)| PublicKey::from_base64(line).map_err(|e| format!("line {} of the update keys isn't a minisign public key ({e})", n + 1)))
         .collect()
 }
 
-/// The checksum list of `release`, when one of `app`'s keys signed it. `Ok(None)`: the app sets no
-/// keys, and nothing was fetched. `Err`: no valid signature (or it couldn't be fetched).
-pub fn verified_sums(app: &App, release: &Release, http: &Http) -> Result<Option<Vec<(String, String)>>, String> {
+/// What [`check_release`] found out about a release.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Checked {
+    /// The app sets no signing keys; nothing was fetched.
+    NoKeys,
+    /// One of the app's keys signed the release's checksum list: its `(hash, name)` lines.
+    Signed(Vec<(String, String)>),
+    /// The release has no valid signature: it publishes no checksum list or no signature (a 404),
+    /// the signature doesn't decode, no key accepts it, or the signed list isn't text.
+    Unsigned,
+}
+
+/// Checks `release`'s checksum list against `app`'s signing keys. `Err` means it couldn't be found
+/// out: a fetch of the signature or the list failed (no connection, a timeout, an HTTP error other
+/// than 404, a file over its cap), or the app's key list is unreadable.
+pub fn check_release(app: &App, release: &Release, http: &Http) -> Result<Checked, String> {
     let keys = keys(app.signing_keys).map_err(|e| {
         log::warn!("{}: {e}", app.name);
         NOT_SIGNED.to_string()
     })?;
     if keys.is_empty() {
-        return Ok(None);
+        return Ok(Checked::NoKeys);
     }
-    let (Some(sums), Some(signature)) = (release.sums_asset(), release.signature_asset()) else { return Err(NOT_SIGNED.into()) };
+    let Some(sums) = release.sums_asset() else { return Ok(Checked::Unsigned) };
+    // A release known only from its checksum list doesn't list its signature: it sits beside the list.
+    let signature_url = release.signature_asset().map_or_else(|| format!("{}.minisig", sums.url), |a| a.url.clone());
     let fetch = |url: &str, max: usize| http.get_bytes(url, max).map_err(|e| format!("couldn't fetch the release's checksums ({e}). Try again"));
-    let Some(signature) = fetch(&signature.url, MAX_SIGNATURE)? else { return Err(NOT_SIGNED.into()) };
-    let signature = std::str::from_utf8(&signature).ok().and_then(|text| Signature::decode(text).ok()).ok_or(NOT_SIGNED)?;
-    let Some(list) = fetch(&sums.url, MAX_SUMS)? else { return Err(NOT_SIGNED.into()) };
+    let Some(signature) = fetch(&signature_url, MAX_SIGNATURE)? else { return Ok(Checked::Unsigned) };
+    let Some(signature) = std::str::from_utf8(&signature).ok().and_then(|text| Signature::decode(text).ok()) else { return Ok(Checked::Unsigned) };
+    let Some(list) = fetch(&sums.url, MAX_SUMS)? else { return Ok(Checked::Unsigned) };
     if !keys.iter().any(|key| key.verify(&list, &signature, false).is_ok()) {
-        return Err(NOT_SIGNED.into());
+        return Ok(Checked::Unsigned);
     }
-    let text = std::str::from_utf8(&list).map_err(|_| NOT_SIGNED)?;
-    Ok(Some(release::parse_sha256sums(text)))
+    Ok(std::str::from_utf8(&list).map_or(Checked::Unsigned, |text| Checked::Signed(release::parse_sha256sums(text))))
+}
+
+/// The checksum list of `release`, when one of `app`'s keys signed it. `Ok(None)`: the app sets no
+/// keys, and nothing was fetched. `Err`: no valid signature, or it couldn't be found out.
+pub fn verified_sums(app: &App, release: &Release, http: &Http) -> Result<Option<Vec<(String, String)>>, String> {
+    match check_release(app, release, http)? {
+        Checked::NoKeys => Ok(None),
+        Checked::Signed(sums) => Ok(Some(sums)),
+        Checked::Unsigned => Err(NOT_SIGNED.into()),
+    }
 }
 
 /// The first of the [`MAX_CANDIDATES`] newest `candidates` (newest first) whose checksum list has
-/// a valid signature; a release without one is skipped without a word. With no keys set: the first
-/// candidate, and nothing is fetched.
+/// a valid signature and names a file of that release's version; a release without one is skipped
+/// without a word. A check that fails (see [`check_release`]) fails the whole choice, so a network
+/// hiccup never offers an older release. With no keys set: the first candidate, and nothing is
+/// fetched.
 pub fn newest_signed(app: &App, candidates: Vec<Release>, http: &Http) -> Result<Option<Release>, String> {
     if keys(app.signing_keys).map_err(|_| NOT_SIGNED)?.is_empty() {
         return Ok(candidates.into_iter().next());
     }
     for candidate in candidates.into_iter().take(MAX_CANDIDATES) {
-        match verified_sums(app, &candidate, http) {
-            Ok(_) => return Ok(Some(candidate)),
-            Err(e) => log::info!("{}: skipping {}: {e}", app.name, candidate.tag),
+        match check_release(app, &candidate, http)? {
+            Checked::NoKeys => return Ok(Some(candidate)),
+            Checked::Signed(sums) if names_its_version(app, &candidate, &sums) => return Ok(Some(candidate)),
+            Checked::Signed(_) => log::info!("{}: skipping {}: its signed checksum list names no file of that version", app.name, candidate.tag),
+            Checked::Unsigned => log::info!("{}: skipping {}: {NOT_SIGNED}", app.name, candidate.tag),
         }
     }
     Ok(None)
 }
 
+/// Whether the signed list `sums` names a file of `app` whose version is `release`'s: a list
+/// copied from another release, with its signature, doesn't make this one signed.
+fn names_its_version(app: &App, release: &Release, sums: &[(String, String)]) -> bool {
+    let stems: Vec<&str> = app.stems().collect();
+    release.version.as_ref().is_some_and(|version| {
+        sums.iter().any(|(_, name)| {
+            crate::platform::parse_asset_name(name, &stems).is_some_and(|parsed| crate::version::parse(&parsed.version).as_ref() == Some(version))
+        })
+    })
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::http::tests::{Reply, serve};
     use crate::release::Asset;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
 
     type Requests = Arc<Mutex<Vec<Option<String>>>>;
+    pub(crate) type Paths = Arc<Mutex<Vec<String>>>;
+
+    /// Serves `files` (path, body) over plain HTTP until the test ends: a body of `None` answers
+    /// HTTP 500, and any other path 404. Records each path asked for.
+    pub(crate) fn serve_files(files: Vec<(&'static str, Option<Vec<u8>>)>) -> (String, Paths) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen: Paths = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut first = String::new();
+                let _ = reader.read_line(&mut first);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let path = first.split_whitespace().nth(1).unwrap_or_default().to_string();
+                log.lock().unwrap().push(path.clone());
+                let close = "Connection: close\r\n\r\n";
+                let _ = match files.iter().find(|(p, _)| *p == path) {
+                    Some((_, Some(body))) => {
+                        write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n{close}", body.len()).and_then(|()| stream.write_all(body))
+                    }
+                    Some((_, None)) => write!(stream, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n{close}"),
+                    None => write!(stream, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n{close}"),
+                };
+            }
+        });
+        (base, seen)
+    }
+
+    /// How often `path` was asked for.
+    pub(crate) fn asked(paths: &Paths, path: &str) -> usize {
+        paths.lock().unwrap().iter().filter(|p| *p == path).count()
+    }
+
+    /// A release `tag` whose `SHA256SUMS.txt` (and, with `signature_asset`, its listed
+    /// `SHA256SUMS.txt.minisig`) sit under `base`.
+    pub(crate) fn release_at(base: &str, tag: &str, signature_asset: bool) -> Release {
+        let mut assets = vec![Asset { name: "SHA256SUMS.txt".into(), url: format!("{base}/SHA256SUMS.txt"), ..Asset::default() }];
+        if signature_asset {
+            assets.push(Asset { name: "SHA256SUMS.txt.minisig".into(), url: format!("{base}/SHA256SUMS.txt.minisig"), ..Asset::default() });
+        }
+        Release { tag: tag.into(), version: crate::version::parse(tag), assets, ..Release::default() }
+    }
+
+    /// A release whose list and signature `serve_files` serves (`None`: HTTP 500; a missing
+    /// entry: 404); and the paths asked for.
+    fn files(list: Option<Vec<u8>>, sig: Option<Option<Vec<u8>>>, signature_asset: bool) -> (Release, Paths) {
+        let mut files = vec![("/SHA256SUMS.txt", list)];
+        if let Some(sig) = sig {
+            files.push(("/SHA256SUMS.txt.minisig", sig));
+        }
+        let (base, paths) = serve_files(files);
+        (release_at(&base, "v1.0.4", signature_asset), paths)
+    }
+
+    #[test]
+    fn a_missing_bad_or_foreign_signature_means_unsigned() {
+        let (kp, other) = (key_pair(), key_pair());
+        let app = app(&kp.pk.to_base64());
+        let good = || Some(Some(sign(&kp, list().as_bytes()).into_bytes()));
+        let list = || Some(list().into_bytes());
+        // No signature at the listed asset, or at the URL derived from the list's.
+        for signature_asset in [true, false] {
+            let (release, _) = files(list(), None, signature_asset);
+            assert_eq!(check_release(&app, &release, &http()), Ok(Checked::Unsigned));
+        }
+        let (release, _) = files(list(), Some(Some(b"not a signature".to_vec())), true);
+        assert_eq!(check_release(&app, &release, &http()), Ok(Checked::Unsigned));
+        let (release, _) = files(list(), Some(Some(sign(&other, list().unwrap().as_slice()).into_bytes())), true);
+        assert_eq!(check_release(&app, &release, &http()), Ok(Checked::Unsigned));
+        // A list that isn't text, though validly signed.
+        let bytes = vec![0xff, 0xfe, 0x00, 0x41];
+        let (release, _) = files(Some(bytes.clone()), Some(Some(sign(&kp, &bytes).into_bytes())), true);
+        assert_eq!(check_release(&app, &release, &http()), Ok(Checked::Unsigned));
+        // The good one, through the listed asset and through the derived URL.
+        for signature_asset in [true, false] {
+            let (release, _) = files(list(), good(), signature_asset);
+            assert_eq!(check_release(&app, &release, &http()), Ok(Checked::Signed(pairs())));
+        }
+        assert_eq!(check_release(&self::app(""), &files(list(), good(), true).0, &http()), Ok(Checked::NoKeys));
+    }
+
+    #[test]
+    fn a_failed_fetch_is_an_error_not_unsigned() {
+        let kp = key_pair();
+        let app = app(&kp.pk.to_base64());
+        let good = Some(sign(&kp, list().as_bytes()).into_bytes());
+        // The signature answers HTTP 500; then the list does.
+        let (release, _) = files(Some(list().into_bytes()), Some(None), true);
+        assert!(check_release(&app, &release, &http()).is_err_and(|e| e.contains("couldn't fetch")));
+        let (release, _) = files(None, Some(good), true);
+        assert!(check_release(&app, &release, &http()).is_err_and(|e| e.contains("couldn't fetch")));
+        // Nothing listens there.
+        let mut release = files(Some(list().into_bytes()), None, true).0;
+        for asset in &mut release.assets {
+            asset.url = "http://127.0.0.1:9/SHA256SUMS.txt".into();
+        }
+        assert!(check_release(&app, &release, &http()).is_err_and(|e| e.contains("couldn't fetch")));
+    }
+
+    #[test]
+    fn a_release_that_lists_no_signature_is_checked_through_the_derived_address() {
+        let kp = key_pair();
+        let (release, paths) = files(Some(list().into_bytes()), Some(Some(sign(&kp, list().as_bytes()).into_bytes())), false);
+        assert!(release.signature_asset().is_none());
+        assert_eq!(verified_sums(&app(&kp.pk.to_base64()), &release, &http()), Ok(Some(pairs())));
+        assert_eq!(asked(&paths, "/SHA256SUMS.txt.minisig"), 1);
+    }
+
+    #[test]
+    fn the_key_list_follows_the_format_step_by_step() {
+        let kp = key_pair();
+        let key = kp.pk.to_base64();
+        // A byte order mark.
+        assert!(keys(&format!("\u{feff}{key}\n")).is_err_and(|e| e.contains("byte order mark")));
+        assert!(keys("\u{feff}# comment\n").is_err_and(|e| e.contains("byte order mark")));
+        // A line of only a no-break space is not empty.
+        assert!(keys(&format!("{key}\n\u{a0}\n")).is_err());
+        // The carriage return goes only at the very end of a line.
+        assert!(keys(&format!("{key}\r \n")).is_err());
+        // CRLF line ends, spaces and tabs round a key, an indented comment.
+        assert_eq!(keys(&format!("# keys\r\n \t{key}\t \r\n  \t# indented comment\r\n\r\n")).map(|k| k.len()), Ok(1));
+        // Comments and empty lines only: no keys.
+        assert_eq!(keys("# one\n\n  # two\r\n\t\n").map(|k| k.len()), Ok(0));
+    }
 
     const HASH_A: &str = "8a5edab282632443219e051e4ade2d1d5bbc671c781051bf1437897cbdfea0f1";
     const HASH_B: &str = "0b5edab282632443219e051e4ade2d1d5bbc671c781051bf1437897cbdfea0f2";

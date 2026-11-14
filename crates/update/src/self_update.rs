@@ -214,6 +214,10 @@ fn detect(app: &App, exe: &Path) -> Option<Install> {
 /// stops. Asked while the app still runs (so it can show the error) and again by the helper.
 #[cfg(windows)]
 fn msi_step(app: &App, exe: &Path) -> Result<crate::msi_migrate::Step, String> {
+    #[cfg(test)]
+    if let Some(step) = test_hooks::msi_step() {
+        return Ok(step);
+    }
     crate::msi_migrate::windows::step(app, exe)
 }
 
@@ -682,6 +686,10 @@ const PORTABLE_STAGING: &str = "launcher-update";
 /// installed exe that the step replaces.
 #[cfg(windows)]
 fn windows_helper(app: &App, paths: &Paths, pid: u32, exe: &Path, finish: &Finish) -> Result<(), String> {
+    #[cfg(test)]
+    if test_hooks::caught_helper(helper_args(pid, exe, finish)) {
+        return Ok(());
+    }
     let program = std::env::current_exe().map_err(|e| format!("couldn't find this program ({e})"))?;
     let dir = paths.cache.join(HELPER_DIR);
     // The previous update's copy, when it's still there.
@@ -910,6 +918,47 @@ mod wait_watch {
     }
 }
 
+/// Lets a Windows test stand in for the Windows Installer registrations that `msi_step` reads, and
+/// see the arguments the update helper would start with instead of starting it. Per thread and
+/// compiled only for tests, so production behavior is unchanged.
+#[cfg(all(test, windows))]
+mod test_hooks {
+    use std::cell::RefCell;
+    use std::ffi::OsString;
+
+    use crate::msi_migrate::Step;
+
+    thread_local! {
+        static MSI_STEP: RefCell<Option<Step>> = const { RefCell::new(None) };
+        /// `Some` while a test watches; then the arguments of the helper last caught.
+        static HELPER: RefCell<Option<Option<Vec<OsString>>>> = const { RefCell::new(None) };
+    }
+
+    /// Makes `msi_step` answer `step` on this thread (`None`: ask the registry again).
+    pub(super) fn set_msi_step(step: Option<Step>) {
+        MSI_STEP.with(|s| *s.borrow_mut() = step);
+    }
+
+    pub(super) fn msi_step() -> Option<Step> {
+        MSI_STEP.with(|s| s.borrow().clone())
+    }
+
+    /// Catches the helper starts on this thread from now on.
+    pub(super) fn watch_helper() {
+        HELPER.with(|h| *h.borrow_mut() = Some(None));
+    }
+
+    /// Keeps `args` when a test watches; whether it did.
+    pub(super) fn caught_helper(args: Vec<OsString>) -> bool {
+        HELPER.with(|h| h.borrow_mut().as_mut().map(|slot| *slot = Some(args)).is_some())
+    }
+
+    /// The arguments of the helper last caught, and stops watching.
+    pub(super) fn caught_args() -> Option<Vec<OsString>> {
+        HELPER.with(|h| h.borrow_mut().take().flatten())
+    }
+}
+
 /// Waits up to `wait` for `pid` to exit, does `step` once it has, and removes the download either
 /// way. The MSI, and every program in the portable zip, must be signed like `reference`; the MSI
 /// or the zip must match the signed SHA-256 in `step`, when it carries one.
@@ -923,9 +972,10 @@ fn run_step(app: &App, reference: &Path, pid: u32, exe: &Path, step: &Finish, wa
     wait_watch::returned(pid, waited);
     let result = if waited {
         match step {
-            Finish::Msi(msi, sha256) => matches_signed(msi, sha256.as_deref())
-                .and_then(|()| signed_like(app, reference, msi))
+            // The hash is read last, right before the Windows Installer starts.
+            Finish::Msi(msi, sha256) => signed_like(app, reference, msi)
                 .and_then(|()| msi_step(app, exe))
+                .and_then(|step| matches_signed(msi, sha256.as_deref()).map(|()| step))
                 .and_then(|step| crate::msi_migrate::windows::run(msi, &step)),
             Finish::Portable { zip, tmp, sha256 } => match (exe.parent(), exe.file_name()) {
                 (Some(dir), Some(executable)) => matches_signed(zip, sha256.as_deref()).and_then(|()| {
@@ -1430,21 +1480,144 @@ mod tests {
         assert!(!msi.exists());
     }
 
+    /// Makes `msi_step` answer a move whose product code isn't one, on this thread, while it
+    /// lives: the Windows Installer step that follows then fails before it starts `msiexec`.
+    #[cfg(windows)]
+    struct StubMsiStep;
+
+    #[cfg(windows)]
+    impl StubMsiStep {
+        const REFUSAL: &str = "isn't a Windows Installer product code";
+
+        fn new(dir: &Path) -> Self {
+            let (folder, old_folder) = (dir.join("everyone"), dir.join("account"));
+            test_hooks::set_msi_step(Some(crate::msi_migrate::Step::Move { product_code: "not a product code".into(), folder, old_folder }));
+            Self
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for StubMsiStep {
+        fn drop(&mut self) {
+            test_hooks::set_msi_step(None);
+        }
+    }
+
+    /// An MSI for the helper, and the exe it updates.
+    #[cfg(windows)]
+    fn helper_msi(dir: &Path) -> (PathBuf, PathBuf) {
+        let exe = dir.join("artcraft-launcher.exe");
+        std::fs::write(&exe, "0.1.0").unwrap();
+        let msi = dir.join("artcraft-launcher-0.2.0-windows-x64.msi");
+        std::fs::write(&msi, "not the signed package").unwrap();
+        (exe, msi)
+    }
+
     /// The helper hashes the MSI itself: one that differs from the signed number is never run,
     /// even by an unsigned copy, which trusts any publisher.
     #[cfg(windows)]
     #[test]
     fn an_msi_that_differs_from_the_signed_number_is_never_run() {
         let dir = tempfile::tempdir().unwrap();
-        let exe = dir.path().join("artcraft-launcher.exe");
-        std::fs::write(&exe, "0.1.0").unwrap();
-        let msi = dir.path().join("artcraft-launcher-0.2.0-windows-x64.msi");
-        std::fs::write(&msi, "not the signed package").unwrap();
+        let (exe, msi) = helper_msi(dir.path());
+        let _stub = StubMsiStep::new(dir.path());
         let unsigned = std::env::current_exe().unwrap();
         let step = Finish::Msi(msi.clone(), Some("0".repeat(64)));
         let error = run_step(&crate::suite::LAUNCHER, &unsigned, exited_pid(), &exe, &step, std::time::Duration::from_secs(5)).unwrap_err();
         assert!(error.contains("doesn't match its published checksum") && error.contains(&msi.display().to_string()), "{error}");
         assert!(!msi.exists());
+    }
+
+    /// The MSI's hash is read last, right before the Windows Installer starts: after the
+    /// registrations are read, and a matching one goes on to the installer.
+    #[cfg(windows)]
+    #[test]
+    fn the_helper_hashes_the_msi_last_before_the_installer_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let unsigned = std::env::current_exe().unwrap();
+        let run =
+            |step: &Finish, exe: &Path| run_step(&crate::suite::LAUNCHER, &unsigned, exited_pid(), exe, step, std::time::Duration::from_secs(5));
+        // No registration: that refusal comes before the (wrong) hash is looked at.
+        let (exe, msi) = helper_msi(dir.path());
+        let error = run(&Finish::Msi(msi.clone(), Some("0".repeat(64))), &exe).unwrap_err();
+        assert!(error.contains("isn't registered"), "{error}");
+        // The right hash goes on to the installer step.
+        let (exe, msi) = helper_msi(dir.path());
+        let _stub = StubMsiStep::new(dir.path());
+        let sha256 = crate::http::sha256_file(&msi).unwrap();
+        let error = run(&Finish::Msi(msi.clone(), Some(sha256)), &exe).unwrap_err();
+        assert!(error.contains(StubMsiStep::REFUSAL), "{error}");
+        assert!(!msi.exists());
+    }
+
+    /// A portable zip whose bytes match the signed number is unpacked over the app.
+    #[cfg(windows)]
+    #[test]
+    fn a_portable_zip_that_matches_the_signed_number_is_installed() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("ArtCraft Launcher");
+        std::fs::create_dir_all(&folder).unwrap();
+        let exe = folder.join("artcraft-launcher.exe");
+        std::fs::write(&exe, "0.1.0").unwrap();
+        let zip = dir.path().join("artcraft-launcher-0.2.0-windows-x64-portable.zip");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&zip).unwrap());
+        writer.start_file("artcraft-launcher-0.2.0-windows-x64-portable/README.md", zip::write::SimpleFileOptions::default()).unwrap();
+        writer.write_all(b"# ArtCraft Launcher").unwrap();
+        writer.start_file("artcraft-launcher-0.2.0-windows-x64-portable/artcraft-launcher.exe", zip::write::SimpleFileOptions::default()).unwrap();
+        writer.write_all(b"0.2.0").unwrap();
+        writer.finish().unwrap();
+        let tmp = dir.path().join("cache").join(PORTABLE_STAGING);
+        let step = Finish::Portable { zip: zip.clone(), tmp: tmp.clone(), sha256: Some(crate::http::sha256_file(&zip).unwrap()) };
+        let unsigned = std::env::current_exe().unwrap();
+        run_step(&crate::suite::LAUNCHER, &unsigned, exited_pid(), &exe, &step, std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "0.2.0");
+        assert!(folder.join("README.md").exists());
+        assert!(!zip.exists() && !tmp.exists());
+    }
+
+    /// `update` starts the helper with the SHA-256 from the signed checksum list, as the last
+    /// argument, for the MSI and for the portable zip.
+    #[cfg(windows)]
+    #[test]
+    fn update_hands_the_helper_the_signed_number() {
+        use crate::http::tests::{Reply, body, serve};
+        use crate::platform::{Arch, Os};
+        let kp = minisign::KeyPair::generate_unencrypted_keypair().unwrap();
+        let app = App { signing_keys: Box::leak(kp.pk.to_base64().into_boxed_str()), ..crate::suite::LAUNCHER };
+        let (bytes, sha256) = body();
+        for (name, msi) in [("artcraft-launcher-0.2.0-windows-x64.msi", true), ("artcraft-launcher-0.2.0-windows-x64-portable.zip", false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let folder = dir.path().join("ArtCraft Launcher");
+            std::fs::create_dir_all(&folder).unwrap();
+            let exe = folder.join("artcraft-launcher.exe");
+            std::fs::write(&exe, "0.1.0").unwrap();
+            // Its folders beside it, which the helper finds too.
+            std::fs::write(folder.join("portable.txt"), "").unwrap();
+            let paths = Paths::for_exe(&app, &exe).unwrap();
+            let list = format!("{sha256}  {name}\n");
+            let signature = minisign::sign(Some(&kp.pk), &kp.sk, list.as_bytes(), None, None).unwrap().into_string();
+            let (base, _) = crate::signed::tests::serve_files(vec![
+                ("/SHA256SUMS.txt", Some(list.into_bytes())),
+                ("/SHA256SUMS.txt.minisig", Some(signature.into_bytes())),
+            ]);
+            let (url, _) = serve(bytes.clone(), vec![Reply::Full]);
+            let mut release = crate::signed::tests::release_at(&base, "v0.2.0", true);
+            release.assets.insert(0, crate::Asset { name: name.into(), size: bytes.len() as u64, url, sha256: None });
+            let install = if msi { Install::Msi(exe.clone()) } else { Install::Portable(exe.clone()) };
+            let _stub = StubMsiStep::new(dir.path());
+            let http = Http::new(crate::TEST_AGENT).unwrap();
+            test_hooks::watch_helper();
+            let platform = Platform { os: Os::Windows, arch: Arch::X64 };
+            update(&app, &install, &release, platform, &http, &paths, &Stop::default(), &mut |_| {}, &|| Ok(()), None).unwrap();
+            let args = test_hooks::caught_args().unwrap();
+            assert_eq!(args.last().and_then(|a| a.to_str()), Some(sha256.as_str()), "{name}");
+            let (_, _, finish) = parse_helper_args(&args).unwrap();
+            let carried = match finish {
+                Finish::Msi(_, sha256) | Finish::Portable { sha256, .. } => sha256,
+            };
+            assert_eq!(carried.as_deref(), Some(sha256.as_str()), "{name}");
+        }
     }
 
     /// A portable zip that differs from the signed number is not unpacked.

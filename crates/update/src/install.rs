@@ -2262,13 +2262,12 @@ mod tests {
             let (body, _) = body();
             let (url, requests) = serve(body.clone(), (0..replies).map(|_| Reply::Full).collect());
             let asset = Asset { name: NAME.into(), size: body.len() as u64, url, sha256: digest.map(str::to_string) };
-            let (list_url, _) = serve(list.as_bytes().to_vec(), vec![Reply::Full]);
-            let mut assets = vec![asset.clone(), Asset { name: "SHA256SUMS.txt".into(), size: 0, url: list_url, sha256: None }];
-            if let Some(sig) = sig {
-                let (sig_url, _) = serve(sig.into_bytes(), vec![Reply::Full]);
-                assets.push(Asset { name: "SHA256SUMS.txt.minisig".into(), size: 0, url: sig_url, sha256: None });
-            }
-            (Release { tag: "v1.0.4".into(), assets, ..Release::default() }, asset, requests)
+            let mut files = vec![("/SHA256SUMS.txt", Some(list.as_bytes().to_vec()))];
+            files.extend(sig.as_ref().map(|sig| ("/SHA256SUMS.txt.minisig", Some(sig.as_bytes().to_vec()))));
+            let (base, _) = crate::signed::tests::serve_files(files);
+            let mut release = crate::signed::tests::release_at(&base, "v1.0.4", sig.is_some());
+            release.assets.insert(0, asset.clone());
+            (release, asset, requests)
         }
 
         /// `download` into a fresh folder; the result and whether the file stayed.
@@ -2305,6 +2304,17 @@ mod tests {
             let (kp, (_, sha)) = (key_pair(), body());
             let list = format!("{sha}  {NAME}\n");
             let (release, asset, requests) = release(Some(&sha), &list, None, 1);
+            let (result, kept) = fetch(&app(&kp.pk.to_base64()), &release, &asset);
+            assert!(result.as_ref().is_err_and(|e| e.contains("no valid signature")), "{result:?}");
+            assert!(requests.lock().unwrap().is_empty(), "the file wasn't fetched");
+            assert!(!kept);
+        }
+
+        #[test]
+        fn a_release_signed_by_another_key_is_refused_before_the_file_is_fetched() {
+            let (kp, other, (_, sha)) = (key_pair(), key_pair(), body());
+            let list = format!("{sha}  {NAME}\n");
+            let (release, asset, requests) = release(Some(&sha), &list, Some(sign(&other, &list)), 1);
             let (result, kept) = fetch(&app(&kp.pk.to_base64()), &release, &asset);
             assert!(result.as_ref().is_err_and(|e| e.contains("no valid signature")), "{result:?}");
             assert!(requests.lock().unwrap().is_empty(), "the file wasn't fetched");

@@ -252,8 +252,6 @@ pub fn release_from_sums(repo: &str, tag: &str, sums: &[(String, String)]) -> Re
         .map(|(hash, name)| Asset { name: name.clone(), size: 0, url: format!("{prefix}{tag}/{name}"), sha256: Some(hash.clone()) })
         .collect();
     assets.push(Asset { name: "SHA256SUMS.txt".into(), size: 0, url: format!("{prefix}{tag}/SHA256SUMS.txt"), sha256: None });
-    // Its signature, for an app that sets signing keys; nothing fetches it for one that doesn't.
-    assets.push(Asset { name: "SHA256SUMS.txt.minisig".into(), size: 0, url: format!("{prefix}{tag}/SHA256SUMS.txt.minisig"), sha256: None });
     Release {
         tag: tag.to_string(),
         version: version::parse(tag),
@@ -439,6 +437,26 @@ mod tests {
         assert_eq!(parse_github_release_list(json, REPO, false).unwrap().unwrap().tag, "v0.5.0");
         assert_eq!(parse_github_release_list(json, REPO, true).unwrap().unwrap().tag, "v0.6.0-rc.1");
         assert_eq!(parse_github_release_list("[]", REPO, false).unwrap(), None);
+    }
+
+    #[test]
+    fn a_release_known_from_its_checksums_is_as_before() {
+        let sums = [(HASH.to_string(), "photocraft-0.5.0-macos-universal.dmg".to_string())];
+        let prefix = "https://github.com/storytold/photocraft/releases/download/v0.5.0";
+        let expected = Release {
+            tag: "v0.5.0".into(),
+            version: Some(Version::new(0, 5, 0)),
+            name: "v0.5.0".into(),
+            published_at: None,
+            html_url: "https://github.com/storytold/photocraft/releases/tag/v0.5.0".into(),
+            notes: String::new(),
+            prerelease: false,
+            assets: vec![
+                Asset { name: sums[0].1.clone(), size: 0, url: format!("{prefix}/{}", sums[0].1), sha256: Some(HASH.into()) },
+                Asset { name: "SHA256SUMS.txt".into(), size: 0, url: format!("{prefix}/SHA256SUMS.txt"), sha256: None },
+            ],
+        };
+        assert_eq!(release_from_sums(REPO, "v0.5.0", &sums), expected);
     }
 
     #[test]

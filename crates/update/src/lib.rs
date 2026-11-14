@@ -91,9 +91,8 @@ pub(crate) const TEST_AGENT: &str = "ArtCraft-Launcher-Test/0.0";
 #[cfg(test)]
 mod offer_tests {
     use super::{offer, offered_release};
-    use crate::http::tests::{Reply, serve};
+    use crate::signed::tests::{Paths, asked, serve_files};
     use crate::{App, Asset, Http, Release};
-    use std::sync::{Arc, Mutex};
 
     const REPO: &str = "storytold/photocraft";
     const LIST: &str = r#"[{"tag_name":"v0.17.0","prerelease":false,"draft":false,"assets":[]},
@@ -104,7 +103,7 @@ mod offer_tests {
         offered_release(&app, &http, LIST, REPO, running).unwrap().map(|release| release.tag)
     }
 
-    type Requests = Arc<Mutex<Vec<Option<String>>>>;
+    type Requests = Paths;
 
     fn key_pair() -> minisign::KeyPair {
         minisign::KeyPair::generate_unencrypted_keypair().unwrap()
@@ -114,30 +113,62 @@ mod offer_tests {
         App { signing_keys: Box::leak(kp.pk.to_base64().into_boxed_str()), ..App::new("photocraft", "PhotoCraft", "test", REPO) }
     }
 
-    /// `release` with its `SHA256SUMS.txt` and a signature by `signer` served from this machine;
-    /// the requests for the list.
-    fn served(mut release: Release, signer: &minisign::KeyPair) -> (Release, Requests) {
-        let list = format!("{}  photocraft-{}-windows-x64.msi\n", "a".repeat(64), release.version_label());
-        let signature = minisign::sign(Some(&signer.pk), &signer.sk, list.as_bytes(), None, None).unwrap().into_string();
-        let (list_url, requests) = serve(list.into_bytes(), vec![Reply::Full]);
-        let (sig_url, _) = serve(signature.into_bytes(), vec![Reply::Full]);
+    /// The checksum list of a release of version `label`.
+    fn list_for(label: &str) -> String {
+        format!("{}  photocraft-{label}-windows-x64.msi\n", "a".repeat(64))
+    }
+
+    /// `release` with `list` and its signature by `signer` (`None`: HTTP 500) served from this
+    /// machine; the paths asked for.
+    fn served_list(mut release: Release, list: &str, signer: Option<&minisign::KeyPair>) -> (Release, Requests) {
+        let signature = signer.map(|s| minisign::sign(Some(&s.pk), &s.sk, list.as_bytes(), None, None).unwrap().into_string().into_bytes());
+        let (base, requests) = serve_files(vec![("/SHA256SUMS.txt", Some(list.as_bytes().to_vec())), ("/SHA256SUMS.txt.minisig", signature)]);
         for asset in &mut release.assets {
-            match asset.name.as_str() {
-                "SHA256SUMS.txt" => asset.url = list_url.clone(),
-                "SHA256SUMS.txt.minisig" => asset.url = sig_url.clone(),
-                _ => {}
+            if let Some(name) = ["SHA256SUMS.txt", "SHA256SUMS.txt.minisig"].iter().find(|n| **n == asset.name) {
+                asset.url = format!("{base}/{name}");
             }
         }
         (release, requests)
     }
 
+    /// `release` with its own list, signed by `signer`.
+    fn served(release: Release, signer: &minisign::KeyPair) -> (Release, Requests) {
+        let list = list_for(&release.version_label());
+        served_list(release, &list, Some(signer))
+    }
+
     fn release(tag: &str, signer: &minisign::KeyPair) -> (Release, Requests) {
+        served(bare(tag), signer)
+    }
+
+    fn bare(tag: &str) -> Release {
         let assets = ["SHA256SUMS.txt", "SHA256SUMS.txt.minisig"].map(|name| Asset { name: name.into(), ..Asset::default() }).to_vec();
-        served(Release { tag: tag.into(), version: crate::version::parse(tag), assets, ..Release::default() }, signer)
+        Release { tag: tag.into(), version: crate::version::parse(tag), assets, ..Release::default() }
     }
 
     fn lists_fetched(requests: &[Requests]) -> usize {
-        requests.iter().map(|r| r.lock().unwrap().len()).sum()
+        requests.iter().map(|r| asked(r, "/SHA256SUMS.txt")).sum()
+    }
+
+    #[test]
+    fn a_failed_fetch_fails_the_check_and_offers_nothing_older() {
+        let ours = key_pair();
+        // The newest release's signature answers HTTP 500.
+        let (newest, _) = served_list(bare("v1.0.5"), &list_for("1.0.5"), None);
+        let (older, _) = release("v1.0.4", &ours);
+        let http = Http::new(crate::TEST_AGENT).unwrap();
+        let result = offer(&keyed(&ours), &http, vec![newest, older], "1.0.3");
+        assert!(result.as_ref().is_err_and(|e| e.contains("couldn't fetch")), "{result:?}");
+    }
+
+    #[test]
+    fn a_replayed_signed_list_does_not_make_a_fake_release_signed() {
+        let ours = key_pair();
+        // A fake v9.9.9 carrying v1.0.4's real list and signature.
+        let (fake, _) = served_list(bare("v9.9.9"), &list_for("1.0.4"), Some(&ours));
+        let (real, _) = release("v1.0.4", &ours);
+        let http = Http::new(crate::TEST_AGENT).unwrap();
+        assert_eq!(offer(&keyed(&ours), &http, vec![fake, real], "1.0.3").unwrap().map(|r| r.tag).as_deref(), Some("v1.0.4"));
     }
 
     #[test]
@@ -177,8 +208,8 @@ mod offer_tests {
         let (ours, theirs) = (key_pair(), key_pair());
         let sums = [("a".repeat(64), "photocraft-1.0.4-windows-x64.msi".to_string())];
         let from_sums = |tag: &str| crate::release::release_from_sums(REPO, tag, &sums);
-        let signature = from_sums("v1.0.4").signature_asset().map(|a| a.url.clone());
-        assert_eq!(signature.as_deref(), Some("https://github.com/storytold/photocraft/releases/download/v1.0.4/SHA256SUMS.txt.minisig"));
+        // It lists no signature: the check derives its address from the list's.
+        assert!(from_sums("v1.0.4").signature_asset().is_none());
         let http = Http::new(crate::TEST_AGENT).unwrap();
         let (fake, fake_requests) = served(from_sums("v9.9.9"), &theirs);
         assert_eq!(offer(&keyed(&ours), &http, vec![fake], "1.0.3").unwrap(), None);
