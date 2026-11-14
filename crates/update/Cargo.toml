@@ -30,9 +30,13 @@ sha2 = "0.10"
 ureq = { version = "3.4", default-features = false, features = ["rustls-no-provider", "_ring", "gzip", "platform-verifier"] }
 chrono = { workspace = true }
 semver = { version = "1", features = ["serde"] }
+# Checks the minisign signature on a release's SHA256SUMS.txt (`signed`), for an app that sets keys.
+minisign-verify = "0.3"
 
 [dev-dependencies]
 flate2 = "1"
+# Makes throwaway keys and signatures for the `signed` tests.
+minisign = "0.10"
 egui_kittest = "0.37"
 # egui's own Hack and Ubuntu Light for the screenshots (egui is built without default fonts).
 epaint_default_fonts = "0.37"

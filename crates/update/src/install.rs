@@ -90,7 +90,7 @@ pub fn install_at(
         return Err(format!("Cannot update {} to {}: installed version {} is newer", app.name, release.version_label(), inst_v));
     }
     log::info!("{}: starting {} to {} ({})", app.name, if existing.is_some() { "update" } else { "install" }, release.version_label(), kind.label());
-    let file = download(release, asset, job)?;
+    let file = download(app, release, asset, job)?;
     log::info!("{}: download ready ({}), running installer...", app.name, file.display());
     // Past this point the install can't be interrupted halfway.
     (job.phase)(JobPhase::Installing);
@@ -372,13 +372,22 @@ pub fn available_kinds() -> Vec<PackageKind> {
 /// Fetches `asset` into the download folder, checked against its published SHA-256: the feed's
 /// or GitHub's per-file digest, else the release's `SHA256SUMS.txt`. A release with neither is
 /// refused before anything is fetched: a file nothing vouches for is never installed (#90).
-pub(crate) fn download(release: &Release, asset: &Asset, job: &mut Job<'_>) -> Result<PathBuf, String> {
+/// An app that sets signing keys takes the SHA-256 from the signed `SHA256SUMS.txt` only.
+pub(crate) fn download(app: &App, release: &Release, asset: &Asset, job: &mut Job<'_>) -> Result<PathBuf, String> {
+    download_signed(app, release, asset, job).map(|(file, _)| file)
+}
+
+/// [`download`], and the SHA-256 it took from the signed checksum list (`None`: the app sets no
+/// signing keys).
+pub(crate) fn download_signed(app: &App, release: &Release, asset: &Asset, job: &mut Job<'_>) -> Result<(PathBuf, Option<String>), String> {
     if !release::valid_file_name(&asset.name) {
         return Err("the release has an unexpected file name".into());
     }
-    let sha = match &asset.sha256 {
-        Some(s) => Some(s.clone()),
-        None => published_checksum(release, asset, job.http)?,
+    let signed = crate::signed::verified_sums(app, release, job.http)?;
+    let sha = match (&signed, &asset.sha256) {
+        (Some(sums), _) => sums.iter().find(|(_, n)| *n == asset.name).map(|(h, _)| h.clone()),
+        (None, Some(s)) => Some(s.clone()),
+        (None, None) => published_checksum(release, asset, job.http)?,
     };
     let Some(sha) = sha else {
         return Err(format!(
@@ -393,7 +402,7 @@ pub(crate) fn download(release: &Release, asset: &Asset, job: &mut Job<'_>) -> R
         Transfer::Reconnecting { done, total } => phase(JobPhase::Reconnecting { done, total }),
     })?;
     (job.phase)(JobPhase::Verifying);
-    Ok(dest)
+    Ok((dest, signed.map(|_| sha)))
 }
 
 /// The file's line in the release's `SHA256SUMS.txt`. `Ok(None)` only when the release really
@@ -2224,6 +2233,125 @@ mod tests {
         assert!(!download_path(&paths, &asset).exists());
         assert!(requests.lock().unwrap().is_empty(), "nothing was fetched");
         assert!(!phases.contains(&JobPhase::Installing));
+    }
+
+    /// `download` for an app that sets signing keys, and for one that doesn't.
+    mod signed_downloads {
+        use super::*;
+        use crate::http::tests::{Reply, body, serve};
+        use std::sync::{Arc, Mutex};
+
+        const NAME: &str = "wordcraft-1.0.4-windows-x64.msi";
+        type Requests = Arc<Mutex<Vec<Option<String>>>>;
+
+        fn key_pair() -> minisign::KeyPair {
+            minisign::KeyPair::generate_unencrypted_keypair().unwrap()
+        }
+
+        fn sign(kp: &minisign::KeyPair, data: &str) -> String {
+            minisign::sign(Some(&kp.pk), &kp.sk, data.as_bytes(), None, None).unwrap().into_string()
+        }
+
+        fn app(keys: &str) -> App {
+            App { signing_keys: Box::leak(keys.to_string().into_boxed_str()), ..*App::by_id("wordcraft").unwrap() }
+        }
+
+        /// A release of `body`: the file (served `replies` times, with GitHub's `digest`), its
+        /// `SHA256SUMS.txt` (`list`, served once) and, unless `None`, the signature file `sig`.
+        fn release(digest: Option<&str>, list: &str, sig: Option<String>, replies: usize) -> (Release, Asset, Requests) {
+            let (body, _) = body();
+            let (url, requests) = serve(body.clone(), (0..replies).map(|_| Reply::Full).collect());
+            let asset = Asset { name: NAME.into(), size: body.len() as u64, url, sha256: digest.map(str::to_string) };
+            let (list_url, _) = serve(list.as_bytes().to_vec(), vec![Reply::Full]);
+            let mut assets = vec![asset.clone(), Asset { name: "SHA256SUMS.txt".into(), size: 0, url: list_url, sha256: None }];
+            if let Some(sig) = sig {
+                let (sig_url, _) = serve(sig.into_bytes(), vec![Reply::Full]);
+                assets.push(Asset { name: "SHA256SUMS.txt.minisig".into(), size: 0, url: sig_url, sha256: None });
+            }
+            (Release { tag: "v1.0.4".into(), assets, ..Release::default() }, asset, requests)
+        }
+
+        /// `download` into a fresh folder; the result and whether the file stayed.
+        fn fetch(app: &App, release: &Release, asset: &Asset) -> (Result<PathBuf, String>, bool) {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = Paths::under(dir.path());
+            let http = Http::new(crate::TEST_AGENT).unwrap();
+            let mut phase = |_: JobPhase| {};
+            let mut job = Job {
+                http: &http,
+                paths: &paths,
+                stop: &Stop::default(),
+                phase: &mut phase,
+                install_locations: &InstallLocations::default(),
+                replace: false,
+            };
+            let result = download(app, release, asset, &mut job);
+            let kept = download_path(&paths, asset).exists() || std::fs::read_dir(paths.downloads()).is_ok_and(|mut d| d.next().is_some());
+            (result, kept)
+        }
+
+        #[test]
+        fn a_signed_release_installs() {
+            let (kp, (_, sha)) = (key_pair(), body());
+            let list = format!("{sha}  {NAME}\n");
+            let (release, asset, _) = release(None, &list, Some(sign(&kp, &list)), 1);
+            let (result, kept) = fetch(&app(&kp.pk.to_base64()), &release, &asset);
+            assert!(result.is_ok(), "{result:?}");
+            assert!(kept);
+        }
+
+        #[test]
+        fn a_release_without_a_signature_is_refused_before_the_file_is_fetched() {
+            let (kp, (_, sha)) = (key_pair(), body());
+            let list = format!("{sha}  {NAME}\n");
+            let (release, asset, requests) = release(Some(&sha), &list, None, 1);
+            let (result, kept) = fetch(&app(&kp.pk.to_base64()), &release, &asset);
+            assert!(result.as_ref().is_err_and(|e| e.contains("no valid signature")), "{result:?}");
+            assert!(requests.lock().unwrap().is_empty(), "the file wasn't fetched");
+            assert!(!kept);
+        }
+
+        #[test]
+        fn the_signed_list_overrules_github_s_digest() {
+            let (kp, (_, sha)) = (key_pair(), body());
+            let list = format!("{sha}  {NAME}\n");
+            let wrong = "0".repeat(64);
+            let (release, asset, _) = release(Some(&wrong), &list, Some(sign(&kp, &list)), 1);
+            let (result, _) = fetch(&app(&kp.pk.to_base64()), &release, &asset);
+            assert!(result.is_ok(), "{result:?}");
+        }
+
+        #[test]
+        fn a_signed_list_that_does_not_name_the_file_is_refused() {
+            let (kp, (_, sha)) = (key_pair(), body());
+            let list = format!("{sha}  wordcraft-1.0.4-windows-x64-portable.zip\n");
+            let (release, asset, requests) = release(Some(&sha), &list, Some(sign(&kp, &list)), 1);
+            let (result, kept) = fetch(&app(&kp.pk.to_base64()), &release, &asset);
+            assert!(result.as_ref().is_err_and(|e| e.contains("publishes no checksum")), "{result:?}");
+            assert!(requests.lock().unwrap().is_empty(), "the file wasn't fetched");
+            assert!(!kept);
+        }
+
+        #[test]
+        fn a_file_that_differs_from_the_signed_number_is_refused_and_not_kept() {
+            let (kp, (_, sha)) = (key_pair(), body());
+            // GitHub's digest matches the bytes; the signed list does not.
+            let list = format!("{}  {NAME}\n", "1".repeat(64));
+            let (release, asset, _) = release(Some(&sha), &list, Some(sign(&kp, &list)), 2);
+            let (result, kept) = fetch(&app(&kp.pk.to_base64()), &release, &asset);
+            assert!(result.as_ref().is_err_and(|e| e.contains("doesn't match its published checksum")), "{result:?}");
+            assert!(!kept);
+        }
+
+        #[test]
+        fn without_keys_github_s_digest_is_used_and_no_signature_is_asked_for() {
+            let (_, sha) = body();
+            // No signature asset, and a list that disagrees: neither is looked at.
+            let (release, asset, _) = release(Some(&sha), &format!("{}  {NAME}\n", "1".repeat(64)), None, 1);
+            let (result, kept) = fetch(&app(""), &release, &asset);
+            assert!(result.is_ok(), "{result:?}");
+            assert!(kept);
+        }
     }
 
     #[cfg(unix)]

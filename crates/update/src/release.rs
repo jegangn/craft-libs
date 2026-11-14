@@ -52,6 +52,11 @@ impl Release {
     pub fn sums_asset(&self) -> Option<&Asset> {
         self.assets.iter().find(|a| a.name == "SHA256SUMS.txt")
     }
+
+    /// The minisign signature of [`Release::sums_asset`].
+    pub fn signature_asset(&self) -> Option<&Asset> {
+        self.assets.iter().find(|a| a.name == "SHA256SUMS.txt.minisig")
+    }
 }
 
 const MAX_NOTES: usize = 64 * 1024;
@@ -187,6 +192,24 @@ pub fn parse_github_release_list(json: &str, repo: &str, allow_prerelease: bool)
     Ok(best)
 }
 
+/// Reads `GET /repos/<repo>/releases`: the stable published releases, newest first.
+pub fn parse_github_release_candidates(json: &str, repo: &str) -> Result<Vec<Release>, String> {
+    let v: serde_json::Value = serde_json::from_str(json).map_err(|e| format!("unreadable answer from GitHub ({e})"))?;
+    let list = v.as_array().ok_or("unexpected answer from GitHub")?;
+    let mut releases: Vec<Release> = list
+        .iter()
+        .filter(|item| !item["draft"].as_bool().unwrap_or(false))
+        .filter_map(|item| release_from_value(item, repo).ok())
+        .filter(|r| !r.prerelease && r.version.as_ref().is_some_and(version::is_stable))
+        .collect();
+    // A stable sort: of two equal versions the first listed stays first, as in `parse_github_release_list`.
+    releases.sort_by(|a, b| match (&a.version, &b.version) {
+        (Some(a), Some(b)) => version::compare(b, a),
+        _ => std::cmp::Ordering::Equal,
+    });
+    Ok(releases)
+}
+
 fn release_from_value(v: &serde_json::Value, repo: &str) -> Result<Release, String> {
     if let Some(msg) = v["message"].as_str() {
         return Err(if msg == "Not Found" { "no releases yet".into() } else { format!("GitHub says: {}", truncate(msg, 200)) });
@@ -229,6 +252,8 @@ pub fn release_from_sums(repo: &str, tag: &str, sums: &[(String, String)]) -> Re
         .map(|(hash, name)| Asset { name: name.clone(), size: 0, url: format!("{prefix}{tag}/{name}"), sha256: Some(hash.clone()) })
         .collect();
     assets.push(Asset { name: "SHA256SUMS.txt".into(), size: 0, url: format!("{prefix}{tag}/SHA256SUMS.txt"), sha256: None });
+    // Its signature, for an app that sets signing keys; nothing fetches it for one that doesn't.
+    assets.push(Asset { name: "SHA256SUMS.txt.minisig".into(), size: 0, url: format!("{prefix}{tag}/SHA256SUMS.txt.minisig"), sha256: None });
     Release {
         tag: tag.to_string(),
         version: version::parse(tag),
@@ -414,6 +439,20 @@ mod tests {
         assert_eq!(parse_github_release_list(json, REPO, false).unwrap().unwrap().tag, "v0.5.0");
         assert_eq!(parse_github_release_list(json, REPO, true).unwrap().unwrap().tag, "v0.6.0-rc.1");
         assert_eq!(parse_github_release_list("[]", REPO, false).unwrap(), None);
+    }
+
+    #[test]
+    fn candidates_are_the_stable_releases_newest_first() {
+        let json = r#"[
+            {"tag_name":"v0.4.0","prerelease":false,"draft":false,"assets":[]},
+            {"tag_name":"v0.6.0-rc.1","prerelease":false,"draft":false,"assets":[]},
+            {"tag_name":"v0.5.1","prerelease":true,"draft":false,"assets":[]},
+            {"tag_name":"v0.7.0","draft":true,"assets":[]},
+            {"tag_name":"not a version","prerelease":false,"draft":false,"assets":[]},
+            {"tag_name":"v0.5.0","prerelease":false,"draft":false,"assets":[]}]"#;
+        let tags: Vec<String> = parse_github_release_candidates(json, REPO).unwrap().into_iter().map(|r| r.tag).collect();
+        assert_eq!(tags, ["v0.5.0", "v0.4.0"]);
+        assert!(parse_github_release_candidates("{}", REPO).is_err());
     }
 
     #[test]

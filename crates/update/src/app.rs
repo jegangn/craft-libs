@@ -23,6 +23,9 @@ pub struct App {
     /// Who makes it, shown as "by <developer>" in the update prompt. [`DEVELOPER`] unless the app
     /// says otherwise.
     pub developer: &'static str,
+    /// The minisign public keys (base64, one on a line, `#` starts a comment) that must sign a
+    /// release's `SHA256SUMS.txt` before it is offered or installed. `""`: no signature check.
+    pub signing_keys: &'static str,
 }
 
 /// The developer of every app in the storytold organisation.
@@ -31,7 +34,7 @@ pub const DEVELOPER: &str = "ArtCraft";
 impl App {
     /// An app with no former names and no icon.
     pub const fn new(id: &'static str, name: &'static str, tagline: &'static str, repo: &'static str) -> Self {
-        Self { id, name, tagline, repo, former_ids: &[], former_names: &[], icon_png: None, accent: None, developer: DEVELOPER }
+        Self { id, name, tagline, repo, former_ids: &[], former_names: &[], icon_png: None, accent: None, developer: DEVELOPER, signing_keys: "" }
     }
 
     /// `ai.storyteller.<id>`: macOS bundle id, Flatpak id and Linux desktop-file id.

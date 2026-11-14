@@ -361,7 +361,7 @@ pub fn update(
     let asset = asset.clone();
     crate::install::bind_artifact_version(app, release, &asset)?;
     let mut job = Job { http, paths, stop, phase, install_locations: &Default::default(), replace: false };
-    let file = install::download(release, &asset, &mut job)?;
+    let (file, signed_sha256) = install::download_signed(app, release, &asset, &mut job)?;
     #[cfg(windows)]
     windows_precheck(app, install, paths, &file)?;
     // The restart ends this process: nothing else may be under way.
@@ -409,16 +409,16 @@ pub fn update(
                 relaunch_flatpak_after_exit(app)
             }
             #[cfg(windows)]
-            Install::Msi(exe) => windows_helper(app, paths, pid, exe, &msi_finish(&file)?),
+            Install::Msi(exe) => windows_helper(app, paths, pid, exe, &msi_finish(&file, signed_sha256)?),
             #[cfg(windows)]
             Install::Portable(exe) => {
                 exe.parent().ok_or_else(|| format!("{} isn't in a folder", app.name))?;
-                windows_helper(app, paths, pid, exe, &Finish::Portable { zip: file, tmp: paths.cache.join(PORTABLE_STAGING) })
+                windows_helper(app, paths, pid, exe, &Finish::Portable { zip: file, tmp: paths.cache.join(PORTABLE_STAGING), sha256: signed_sha256 })
             }
             #[cfg(windows)]
             Install::Standalone(exe) => {
                 exe.parent().ok_or_else(|| format!("{} isn't in a folder", app.name))?;
-                windows_helper(app, paths, pid, exe, &Finish::Portable { zip: file, tmp: paths.cache.join(PORTABLE_STAGING) })
+                windows_helper(app, paths, pid, exe, &Finish::Portable { zip: file, tmp: paths.cache.join(PORTABLE_STAGING), sha256: signed_sha256 })
             }
             #[cfg(unix)]
             Install::Standalone(exe) => {
@@ -429,7 +429,7 @@ pub fn update(
             }
             #[allow(unreachable_patterns)]
             _ => {
-                let _ = (pid, &file);
+                let _ = (pid, &file, &signed_sha256);
                 Err(format!("this copy of {} can't update itself; download the new version instead", app.name))
             }
         }
@@ -608,21 +608,29 @@ pub const FINISH_FLAG: &str = "--finish-update";
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(not(windows), allow(dead_code))]
 enum Finish {
-    /// Run the new MSI, which reinstalls into the same folder.
-    Msi(PathBuf),
+    /// Run the new MSI, which reinstalls into the same folder. With the SHA-256 from the signed
+    /// checksum list, when the app sets signing keys.
+    Msi(PathBuf, Option<String>),
     /// Unpack the new portable zip into `tmp` and copy it over the launcher's folder.
-    Portable { zip: PathBuf, tmp: PathBuf },
+    Portable { zip: PathBuf, tmp: PathBuf, sha256: Option<String> },
 }
 
 /// The helper's arguments: [`FINISH_FLAG`], the process id to wait for, the exe to start
-/// afterwards, then the step.
+/// afterwards, then the step, and the signed SHA-256 when there is one.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn helper_args(pid: u32, exe: &Path, finish: &Finish) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec![FINISH_FLAG.into(), pid.to_string().into(), exe.into()];
-    match finish {
-        Finish::Msi(msi) => args.extend(["msi".into(), msi.into()]),
-        Finish::Portable { zip, tmp } => args.extend(["portable".into(), zip.into(), tmp.into()]),
-    }
+    let sha256 = match finish {
+        Finish::Msi(msi, sha256) => {
+            args.extend(["msi".into(), msi.into()]);
+            sha256
+        }
+        Finish::Portable { zip, tmp, sha256 } => {
+            args.extend(["portable".into(), zip.into(), tmp.into()]);
+            sha256
+        }
+    };
+    args.extend(sha256.iter().map(OsString::from));
     args
 }
 
@@ -634,17 +642,32 @@ fn parse_helper_args(args: &[OsString]) -> Option<(u32, PathBuf, Finish)> {
         return None;
     }
     let pid = pid.to_str()?.parse().ok()?;
+    let sha256 = |arg: &OsString| arg.to_str().filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())).map(str::to_string);
     let finish = match step {
-        [kind, msi] if kind == "msi" => Finish::Msi(msi.into()),
-        [kind, zip, tmp] if kind == "portable" => Finish::Portable { zip: zip.into(), tmp: tmp.into() },
+        [kind, msi] if kind == "msi" => Finish::Msi(msi.into(), None),
+        [kind, msi, sum] if kind == "msi" => Finish::Msi(msi.into(), Some(sha256(sum)?)),
+        [kind, zip, tmp] if kind == "portable" => Finish::Portable { zip: zip.into(), tmp: tmp.into(), sha256: None },
+        [kind, zip, tmp, sum] if kind == "portable" => Finish::Portable { zip: zip.into(), tmp: tmp.into(), sha256: Some(sha256(sum)?) },
         _ => return None,
     };
     Some((pid, exe.into(), finish))
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
-fn msi_finish(file: &Path) -> Result<Finish, String> {
-    install::msi_path(file).map(Finish::Msi)
+fn msi_finish(file: &Path, sha256: Option<String>) -> Result<Finish, String> {
+    install::msi_path(file).map(|msi| Finish::Msi(msi, sha256))
+}
+
+/// Refuses `file` when its SHA-256 differs from the signed number, read from the file itself
+/// right before it is used. `None`: the app sets no signing keys.
+#[cfg(windows)]
+fn matches_signed(file: &Path, sha256: Option<&str>) -> Result<(), String> {
+    match sha256 {
+        Some(sha256) if !crate::http::sha256_file(file)?.eq_ignore_ascii_case(sha256) => {
+            Err(format!("the download {} doesn't match its published checksum, so it wasn't installed", file.display()))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// The cache folder the update helper is copied into.
@@ -693,7 +716,7 @@ pub fn finish(app: &App, args: &[OsString]) -> Option<Result<(), String>> {
     }
     // Read before the step: the update may move or replace the old exe.
     let registered =
-        matches!(step, Finish::Msi(_)) && matches!(crate::msi_copy::windows::find(app, &exe), Some(crate::msi_copy::MsiCopy::Registered { .. }));
+        matches!(step, Finish::Msi(..)) && matches!(crate::msi_copy::windows::find(app, &exe), Some(crate::msi_copy::MsiCopy::Registered { .. }));
     let done = run_step(app, &me, pid, &exe, &step, HELPER_WAIT);
     if let Err(e) = &done {
         record_failure(&paths, e);
@@ -826,8 +849,8 @@ fn check_helper(app: &App, me: &Path, paths: &Paths, exe: &Path, step: &Finish) 
     let downloads = canonical(&paths.downloads())?;
     let in_downloads = |file: &Path| canonical(file).map(|f| f.parent() == Some(downloads.as_path()));
     let allowed = match (detect(app, &exe), step) {
-        (Some(Install::Msi(installed)), Finish::Msi(msi)) => installed == exe && in_downloads(msi)?,
-        (Some(Install::Portable(installed) | Install::Standalone(installed)), Finish::Portable { zip, tmp }) => {
+        (Some(Install::Msi(installed)), Finish::Msi(msi, _)) => installed == exe && in_downloads(msi)?,
+        (Some(Install::Portable(installed) | Install::Standalone(installed)), Finish::Portable { zip, tmp, .. }) => {
             installed == exe
                 && in_downloads(zip)?
                 && tmp.file_name().is_some_and(|n| n == PORTABLE_STAGING)
@@ -888,7 +911,8 @@ mod wait_watch {
 }
 
 /// Waits up to `wait` for `pid` to exit, does `step` once it has, and removes the download either
-/// way. The MSI, and every program in the portable zip, must be signed like `reference`.
+/// way. The MSI, and every program in the portable zip, must be signed like `reference`; the MSI
+/// or the zip must match the signed SHA-256 in `step`, when it carries one.
 #[cfg(windows)]
 fn run_step(app: &App, reference: &Path, pid: u32, exe: &Path, step: &Finish, wait: std::time::Duration) -> Result<(), String> {
     #[cfg(test)]
@@ -899,13 +923,16 @@ fn run_step(app: &App, reference: &Path, pid: u32, exe: &Path, step: &Finish, wa
     wait_watch::returned(pid, waited);
     let result = if waited {
         match step {
-            Finish::Msi(msi) => {
-                signed_like(app, reference, msi).and_then(|()| msi_step(app, exe)).and_then(|step| crate::msi_migrate::windows::run(msi, &step))
-            }
-            Finish::Portable { zip, tmp } => match (exe.parent(), exe.file_name()) {
-                (Some(dir), Some(executable)) => crate::portable::unpack_over(zip, tmp, dir, executable, &|file| {
-                    // The expected executable must be signed even when its contents aren't a PE file.
-                    if file.file_name() == Some(executable) || is_program(file) { signed_like(app, reference, file) } else { Ok(()) }
+            Finish::Msi(msi, sha256) => matches_signed(msi, sha256.as_deref())
+                .and_then(|()| signed_like(app, reference, msi))
+                .and_then(|()| msi_step(app, exe))
+                .and_then(|step| crate::msi_migrate::windows::run(msi, &step)),
+            Finish::Portable { zip, tmp, sha256 } => match (exe.parent(), exe.file_name()) {
+                (Some(dir), Some(executable)) => matches_signed(zip, sha256.as_deref()).and_then(|()| {
+                    crate::portable::unpack_over(zip, tmp, dir, executable, &|file| {
+                        // The expected executable must be signed even when its contents aren't a PE file.
+                        if file.file_name() == Some(executable) || is_program(file) { signed_like(app, reference, file) } else { Ok(()) }
+                    })
                 }),
                 _ => Err(format!("{} isn't in a folder", app.name)),
             },
@@ -914,7 +941,7 @@ fn run_step(app: &App, reference: &Path, pid: u32, exe: &Path, step: &Finish, wa
         Err(format!("{} was still running after a minute, so the update wasn't installed", app.name))
     };
     match step {
-        Finish::Msi(msi) => {
+        Finish::Msi(msi, _) => {
             let _ = std::fs::remove_file(msi);
         }
         // `unpack_over` removes the staging folder, unless it holds files it couldn't put back.
@@ -937,13 +964,13 @@ mod tests {
         std::fs::write(&file, b"test package").unwrap();
         let link = dir.path().join("cached.msi");
         std::os::unix::fs::symlink(&file, &link).unwrap();
-        assert_eq!(msi_finish(&link).unwrap(), Finish::Msi(file.canonicalize().unwrap()));
+        assert_eq!(msi_finish(&link, None).unwrap(), Finish::Msi(file.canonicalize().unwrap(), None));
     }
 
     #[test]
     fn a_missing_msi_cannot_schedule_a_self_update() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(msi_finish(&dir.path().join("missing.msi")).is_err());
+        assert!(msi_finish(&dir.path().join("missing.msi"), None).is_err());
     }
 
     /// The helper reads back exactly what the launcher passed it, paths with spaces and
@@ -951,16 +978,35 @@ mod tests {
     #[test]
     fn the_update_helper_reads_back_its_arguments() {
         let exe = Path::new(r"C:\Users\O'Brien\AppData\Local\Programs\ArtCraft Launcher\artcraft-launcher.exe");
-        let msi = Finish::Msi(PathBuf::from(r"C:\Users\O'Brien\AppData\Local\ArtCraft Launcher\cache\artcraft-launcher-0.7.0-windows-x64.msi"));
-        let portable =
-            Finish::Portable { zip: PathBuf::from(r"D:\Tools\x 1.zip"), tmp: PathBuf::from(r"D:\Tools\ArtCraftLauncherData\cache\launcher-update") };
-        for finish in [msi, portable] {
+        let sha = "8a5edab282632443219e051e4ade2d1d5bbc671c781051bf1437897cbdfea0f1";
+        let msi = |sha256: Option<&str>| {
+            Finish::Msi(
+                PathBuf::from(r"C:\Users\O'Brien\AppData\Local\ArtCraft Launcher\cache\artcraft-launcher-0.7.0-windows-x64.msi"),
+                sha256.map(str::to_string),
+            )
+        };
+        let portable = |sha256: Option<&str>| Finish::Portable {
+            zip: PathBuf::from(r"D:\Tools\x 1.zip"),
+            tmp: PathBuf::from(r"D:\Tools\ArtCraftLauncherData\cache\launcher-update"),
+            sha256: sha256.map(str::to_string),
+        };
+        for finish in [msi(None), portable(None), msi(Some(sha)), portable(Some(sha))] {
             let args = helper_args(4242, exe, &finish);
             assert_eq!(args.first().map(OsString::as_os_str), Some(std::ffi::OsStr::new(FINISH_FLAG)));
             assert_eq!(parse_helper_args(&args), Some((4242, exe.to_path_buf(), finish)));
         }
         let os = |args: &[&str]| args.iter().map(OsString::from).collect::<Vec<_>>();
+        // The number follows the file; the shapes without it still parse.
+        assert_eq!(helper_args(4242, exe, &msi(Some(sha))).last().and_then(|a| a.to_str()), Some(sha));
+        assert_eq!(helper_args(4242, exe, &portable(Some(sha))).last().and_then(|a| a.to_str()), Some(sha));
+        let old = parse_helper_args(&os(&[FINISH_FLAG, "4242", "launcher.exe", "msi", "a.msi"]));
+        assert_eq!(old, Some((4242, PathBuf::from("launcher.exe"), Finish::Msi("a.msi".into(), None))));
+        let old = parse_helper_args(&os(&[FINISH_FLAG, "4242", "launcher.exe", "portable", "a.zip", "tmp"]));
+        assert_eq!(old, Some((4242, PathBuf::from("launcher.exe"), Finish::Portable { zip: "a.zip".into(), tmp: "tmp".into(), sha256: None })));
         for bad in [
+            os(&[FINISH_FLAG, "4242", "launcher.exe", "msi", "a.msi", "not a checksum"]),
+            os(&[FINISH_FLAG, "4242", "launcher.exe", "portable", "a.zip", "tmp", "not a checksum"]),
+            os(&[FINISH_FLAG, "4242", "launcher.exe", "msi", "a.msi", sha, "extra"]),
             os(&[]),
             os(&["--hidden"]),
             os(&[FINISH_FLAG, "4242", "launcher.exe"]),
@@ -1008,7 +1054,7 @@ mod tests {
         }
         writer.finish().unwrap();
         let tmp = dir.path().join("cache").join("launcher-update");
-        let step = Finish::Portable { zip: zip.clone(), tmp: tmp.clone() };
+        let step = Finish::Portable { zip: zip.clone(), tmp: tmp.clone(), sha256: None };
 
         let mut old = std::process::Command::new("ping").args(["-n", "3", "127.0.0.1"]).stdout(std::process::Stdio::null()).spawn().unwrap();
         let exe = folder.join("artcraft-launcher.exe");
@@ -1112,7 +1158,7 @@ mod tests {
         }
         writer.finish().unwrap();
         let tmp = dir.path().join("cache").join(PORTABLE_STAGING);
-        let step = Finish::Portable { zip: zip.clone(), tmp: tmp.clone() };
+        let step = Finish::Portable { zip: zip.clone(), tmp: tmp.clone(), sha256: None };
 
         // Timeouts only bound the test; each failure names the observation that never arrived.
         let entered_timeout = std::time::Duration::from_secs(10);
@@ -1196,7 +1242,7 @@ mod tests {
         let other_app = folder.join(format!("{}.exe", crate::suite::PHOTOCRAFT.id));
         std::fs::write(&other_app, "another Craft app").unwrap();
         let staging = cache.join(PORTABLE_STAGING);
-        let portable = |zip: &Path, tmp: &Path| Finish::Portable { zip: zip.to_path_buf(), tmp: tmp.to_path_buf() };
+        let portable = |zip: &Path, tmp: &Path| Finish::Portable { zip: zip.to_path_buf(), tmp: tmp.to_path_buf(), sha256: None };
 
         assert_eq!(check_helper(&crate::suite::LAUNCHER, &me, &paths, &exe, &portable(&zip, &staging)), Ok(()));
         // A helper that isn't in the installation's cache.
@@ -1213,14 +1259,14 @@ mod tests {
         assert!(check_helper(&crate::suite::LAUNCHER, &me, &paths, &exe, &portable(&zip, &dir.path().join(PORTABLE_STAGING))).is_err());
         assert!(check_helper(&crate::suite::LAUNCHER, &me, &paths, &exe, &portable(&zip, &paths.downloads())).is_err());
         // An MSI for a portable installation.
-        assert!(check_helper(&crate::suite::LAUNCHER, &me, &paths, &exe, &Finish::Msi(zip.clone())).is_err());
+        assert!(check_helper(&crate::suite::LAUNCHER, &me, &paths, &exe, &Finish::Msi(zip.clone(), None)).is_err());
         // Without portable.txt it is a standalone executable, which updates from the same zip.
         std::fs::remove_file(folder.join("portable.txt")).unwrap();
         assert_eq!(check_helper(&crate::suite::LAUNCHER, &me, &paths, &exe, &portable(&zip, &staging)), Ok(()));
         // A foreign executable is not a standalone launcher either.
         assert!(check_helper(&crate::suite::LAUNCHER, &me, &paths, &other_in_folder, &portable(&zip, &staging)).is_err());
         // An MSI is for an MSI installation only.
-        assert!(check_helper(&crate::suite::LAUNCHER, &me, &paths, &exe, &Finish::Msi(zip.clone())).is_err());
+        assert!(check_helper(&crate::suite::LAUNCHER, &me, &paths, &exe, &Finish::Msi(zip.clone(), None)).is_err());
     }
 
     /// The helper finds a portable launcher's folders beside it, as that launcher does.
@@ -1310,7 +1356,7 @@ mod tests {
             &system_program("cmd.exe"),
             running,
             &exe,
-            &Finish::Msi(msi.clone()),
+            &Finish::Msi(msi.clone(), None),
             std::time::Duration::from_millis(300),
         )
         .unwrap_err();
@@ -1376,12 +1422,56 @@ mod tests {
             &system_program("cmd.exe"),
             exited_pid(),
             &exe,
-            &Finish::Msi(msi.clone()),
+            &Finish::Msi(msi.clone(), None),
             std::time::Duration::from_secs(5),
         )
         .unwrap_err();
         assert!(error.contains("isn't signed"), "{error}");
         assert!(!msi.exists());
+    }
+
+    /// The helper hashes the MSI itself: one that differs from the signed number is never run,
+    /// even by an unsigned copy, which trusts any publisher.
+    #[cfg(windows)]
+    #[test]
+    fn an_msi_that_differs_from_the_signed_number_is_never_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("artcraft-launcher.exe");
+        std::fs::write(&exe, "0.1.0").unwrap();
+        let msi = dir.path().join("artcraft-launcher-0.2.0-windows-x64.msi");
+        std::fs::write(&msi, "not the signed package").unwrap();
+        let unsigned = std::env::current_exe().unwrap();
+        let step = Finish::Msi(msi.clone(), Some("0".repeat(64)));
+        let error = run_step(&crate::suite::LAUNCHER, &unsigned, exited_pid(), &exe, &step, std::time::Duration::from_secs(5)).unwrap_err();
+        assert!(error.contains("doesn't match its published checksum") && error.contains(&msi.display().to_string()), "{error}");
+        assert!(!msi.exists());
+    }
+
+    /// A portable zip that differs from the signed number is not unpacked.
+    #[cfg(windows)]
+    #[test]
+    fn a_portable_zip_that_differs_from_the_signed_number_is_not_unpacked() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("ArtCraft Launcher");
+        std::fs::create_dir_all(&folder).unwrap();
+        let exe = folder.join("artcraft-launcher.exe");
+        std::fs::write(&exe, "0.1.0").unwrap();
+        let zip = dir.path().join("artcraft-launcher-0.2.0-windows-x64-portable.zip");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&zip).unwrap());
+        writer.start_file("artcraft-launcher-0.2.0-windows-x64-portable/README.md", zip::write::SimpleFileOptions::default()).unwrap();
+        writer.write_all(b"# ArtCraft Launcher").unwrap();
+        writer.start_file("artcraft-launcher-0.2.0-windows-x64-portable/artcraft-launcher.exe", zip::write::SimpleFileOptions::default()).unwrap();
+        writer.write_all(b"0.2.0").unwrap();
+        writer.finish().unwrap();
+        let tmp = dir.path().join("cache").join(PORTABLE_STAGING);
+        let step = Finish::Portable { zip: zip.clone(), tmp: tmp.clone(), sha256: Some("0".repeat(64)) };
+        let unsigned = std::env::current_exe().unwrap();
+        let error = run_step(&crate::suite::LAUNCHER, &unsigned, exited_pid(), &exe, &step, std::time::Duration::from_secs(5)).unwrap_err();
+        assert!(error.contains("doesn't match its published checksum") && error.contains(&zip.display().to_string()), "{error}");
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "0.1.0");
+        assert!(!folder.join("README.md").exists(), "nothing is unpacked");
+        assert!(!zip.exists() && !tmp.exists());
     }
 
     /// A program in the portable zip that isn't signed by the launcher's publisher stops the
@@ -1406,7 +1496,7 @@ mod tests {
         writer.write_all(&std::fs::read(std::env::current_exe().unwrap()).unwrap()).unwrap();
         writer.finish().unwrap();
         let tmp = dir.path().join("cache").join(PORTABLE_STAGING);
-        let step = Finish::Portable { zip: zip.clone(), tmp: tmp.clone() };
+        let step = Finish::Portable { zip: zip.clone(), tmp: tmp.clone(), sha256: None };
         let error =
             run_step(&crate::suite::LAUNCHER, &system_program("cmd.exe"), exited_pid(), &exe, &step, std::time::Duration::from_secs(5)).unwrap_err();
         assert!(error.contains("isn't signed"), "{error}");
@@ -1438,7 +1528,7 @@ mod tests {
             }
             writer.finish().unwrap();
             let tmp = dir.path().join(PORTABLE_STAGING);
-            let step = Finish::Portable { zip: zip.clone(), tmp: tmp.clone() };
+            let step = Finish::Portable { zip: zip.clone(), tmp: tmp.clone(), sha256: None };
             let error = run_step(&crate::suite::LAUNCHER, &system_program("cmd.exe"), exited_pid(), &exe, &step, std::time::Duration::from_secs(5))
                 .unwrap_err();
             assert!(error.contains(if launcher.is_some() { "isn't signed" } else { "doesn't contain" }), "{error}");
@@ -1474,7 +1564,7 @@ mod tests {
         }
         writer.finish().unwrap();
         let tmp = dir.path().join("cache").join(PORTABLE_STAGING);
-        let step = Finish::Portable { zip: zip.clone(), tmp: tmp.clone() };
+        let step = Finish::Portable { zip: zip.clone(), tmp: tmp.clone(), sha256: None };
         let error =
             run_step(&crate::suite::LAUNCHER, &system_program("cmd.exe"), exited_pid(), &exe, &step, std::time::Duration::from_secs(5)).unwrap_err();
         assert!(error.contains("NOTICE"), "{error}");
